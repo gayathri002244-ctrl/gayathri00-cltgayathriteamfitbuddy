@@ -1,1773 +1,621 @@
-"""Logic for creating models."""
-
-# Because `dict` is in the local namespace of the `BaseModel` class, we use `Dict` for annotations.
-# TODO v3 fallback to `dict` when the deprecated `dict` method gets removed.
-# ruff: noqa: UP035
-
 from __future__ import annotations as _annotations
 
-import operator
-import sys
-import types
-import typing
-import warnings
-from collections.abc import Generator, Mapping
-from copy import copy, deepcopy
-from functools import cached_property
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    ClassVar,
-    Dict,
-    Literal,
-    TypeVar,
-    Union,
-    cast,
-    overload,
+import asyncio
+import inspect
+import threading
+from argparse import Namespace
+from collections.abc import Mapping
+from types import SimpleNamespace
+from typing import Any, ClassVar, TypeVar
+
+from pydantic import ConfigDict
+from pydantic._internal._config import config_keys
+from pydantic._internal._signature import _field_name_for_signature
+from pydantic._internal._utils import deep_update, is_model_class
+from pydantic.dataclasses import is_pydantic_dataclass
+from pydantic.main import BaseModel
+
+from .exceptions import SettingsError
+from .sources import (
+    ENV_FILE_SENTINEL,
+    CliSettingsSource,
+    DefaultSettingsSource,
+    DotEnvSettingsSource,
+    DotenvType,
+    EnvSettingsSource,
+    InitSettingsSource,
+    PathType,
+    PydanticBaseSettingsSource,
+    PydanticModel,
+    SecretsSettingsSource,
+    get_subcommand,
 )
 
-import pydantic_core
-import typing_extensions
-from pydantic_core import PydanticUndefined, ValidationError
-from typing_extensions import Self, TypeAlias, Unpack
-
-from . import PydanticDeprecatedSince20, PydanticDeprecatedSince211
-from ._internal import (
-    _config,
-    _decorators,
-    _fields,
-    _forward_ref,
-    _generics,
-    _mock_val_ser,
-    _model_construction,
-    _namespace_utils,
-    _repr,
-    _typing_extra,
-    _utils,
-)
-from ._migration import getattr_migration
-from .aliases import AliasChoices, AliasPath
-from .annotated_handlers import GetCoreSchemaHandler, GetJsonSchemaHandler
-from .config import ConfigDict
-from .errors import PydanticUndefinedAnnotation, PydanticUserError
-from .json_schema import DEFAULT_REF_TEMPLATE, GenerateJsonSchema, JsonSchemaMode, JsonSchemaValue, model_json_schema
-from .plugin._schema_validator import PluggableSchemaValidator
-
-if TYPE_CHECKING:
-    from inspect import Signature
-    from pathlib import Path
-
-    from pydantic_core import CoreSchema, SchemaSerializer, SchemaValidator
-
-    from ._internal._namespace_utils import MappingNamespace
-    from ._internal._utils import AbstractSetIntStr, MappingIntStrAny
-    from .deprecated.parse import Protocol as DeprecatedParseProtocol
-    from .fields import ComputedFieldInfo, FieldInfo, ModelPrivateAttr
-else:
-    # See PyCharm issues https://youtrack.jetbrains.com/issue/PY-21915
-    # and https://youtrack.jetbrains.com/issue/PY-51428
-    DeprecationWarning = PydanticDeprecatedSince20
-
-__all__ = 'BaseModel', 'create_model'
-
-# Keep these type aliases available at runtime:
-TupleGenerator: TypeAlias = Generator[tuple[str, Any], None, None]
-# NOTE: In reality, `bool` should be replaced by `Literal[True]` but mypy fails to correctly apply bidirectional
-# type inference (e.g. when using `{'a': {'b': True}}`):
-# NOTE: Keep this type alias in sync with the stub definition in `pydantic-core`:
-IncEx: TypeAlias = Union[set[int], set[str], Mapping[int, Union['IncEx', bool]], Mapping[str, Union['IncEx', bool]]]
-
-_object_setattr = _model_construction.object_setattr
+T = TypeVar('T')
 
 
-def _check_frozen(model_cls: type[BaseModel], name: str, value: Any) -> None:
-    if model_cls.model_config.get('frozen'):
-        error_type = 'frozen_instance'
-    elif getattr(model_cls.__pydantic_fields__.get(name), 'frozen', False):
-        error_type = 'frozen_field'
-    else:
-        return
-
-    raise ValidationError.from_exception_data(
-        model_cls.__name__, [{'type': error_type, 'loc': (name,), 'input': value}]
-    )
-
-
-def _model_field_setattr_handler(model: BaseModel, name: str, val: Any) -> None:
-    model.__dict__[name] = val
-    model.__pydantic_fields_set__.add(name)
-
-
-def _private_setattr_handler(model: BaseModel, name: str, val: Any) -> None:
-    if getattr(model, '__pydantic_private__', None) is None:
-        # While the attribute should be present at this point, this may not be the case if
-        # users do unusual stuff with `model_post_init()` (which is where the  `__pydantic_private__`
-        # is initialized, by wrapping the user-defined `model_post_init()`), e.g. if they mock
-        # the `model_post_init()` call. Ideally we should find a better way to init private attrs.
-        object.__setattr__(model, '__pydantic_private__', {})
-    model.__pydantic_private__[name] = val  # pyright: ignore[reportOptionalSubscript]
-
-
-_SIMPLE_SETATTR_HANDLERS: Mapping[str, Callable[[BaseModel, str, Any], None]] = {
-    'model_field': _model_field_setattr_handler,
-    'validate_assignment': lambda model, name, val: model.__pydantic_validator__.validate_assignment(model, name, val),  # pyright: ignore[reportAssignmentType]
-    'private': _private_setattr_handler,
-    'cached_property': lambda model, name, val: model.__dict__.__setitem__(name, val),
-    'extra_known': lambda model, name, val: _object_setattr(model, name, val),
-}
-
-
-class BaseModel(metaclass=_model_construction.ModelMetaclass):
-    """!!! abstract "Usage Documentation"
-        [Models](../concepts/models.md)
-
-    A base class for creating Pydantic models.
-
-    Attributes:
-        __class_vars__: The names of the class variables defined on the model.
-        __private_attributes__: Metadata about the private attributes of the model.
-        __signature__: The synthesized `__init__` [`Signature`][inspect.Signature] of the model.
-
-        __pydantic_complete__: Whether model building is completed, or if there are still undefined fields.
-        __pydantic_core_schema__: The core schema of the model.
-        __pydantic_custom_init__: Whether the model has a custom `__init__` function.
-        __pydantic_decorators__: Metadata containing the decorators defined on the model.
-            This replaces `Model.__validators__` and `Model.__root_validators__` from Pydantic V1.
-        __pydantic_generic_metadata__: Metadata for generic models; contains data used for a similar purpose to
-            __args__, __origin__, __parameters__ in typing-module generics. May eventually be replaced by these.
-        __pydantic_parent_namespace__: Parent namespace of the model, used for automatic rebuilding of models.
-        __pydantic_post_init__: The name of the post-init method for the model, if defined.
-        __pydantic_root_model__: Whether the model is a [`RootModel`][pydantic.root_model.RootModel].
-        __pydantic_serializer__: The `pydantic-core` `SchemaSerializer` used to dump instances of the model.
-        __pydantic_validator__: The `pydantic-core` `SchemaValidator` used to validate instances of the model.
-
-        __pydantic_fields__: A dictionary of field names and their corresponding [`FieldInfo`][pydantic.fields.FieldInfo] objects.
-        __pydantic_computed_fields__: A dictionary of computed field names and their corresponding [`ComputedFieldInfo`][pydantic.fields.ComputedFieldInfo] objects.
-
-        __pydantic_extra__: A dictionary containing extra values, if [`extra`][pydantic.config.ConfigDict.extra]
-            is set to `'allow'`.
-        __pydantic_fields_set__: The names of fields explicitly set during instantiation.
-        __pydantic_private__: Values of private attributes set on the model instance.
+class SettingsConfigDict(ConfigDict, total=False):
+    case_sensitive: bool
+    nested_model_default_partial_update: bool | None
+    env_prefix: str
+    env_file: DotenvType | None
+    env_file_encoding: str | None
+    env_ignore_empty: bool
+    env_nested_delimiter: str | None
+    env_nested_max_split: int | None
+    env_parse_none_str: str | None
+    env_parse_enums: bool | None
+    cli_prog_name: str | None
+    cli_parse_args: bool | list[str] | tuple[str, ...] | None
+    cli_parse_none_str: str | None
+    cli_hide_none_type: bool
+    cli_avoid_json: bool
+    cli_enforce_required: bool
+    cli_use_class_docs_for_groups: bool
+    cli_exit_on_error: bool
+    cli_prefix: str
+    cli_flag_prefix_char: str
+    cli_implicit_flags: bool | None
+    cli_ignore_unknown_args: bool | None
+    cli_kebab_case: bool | None
+    cli_shortcuts: Mapping[str, str | list[str]] | None
+    secrets_dir: PathType | None
+    json_file: PathType | None
+    json_file_encoding: str | None
+    yaml_file: PathType | None
+    yaml_file_encoding: str | None
+    yaml_config_section: str | None
+    """
+    Specifies the top-level key in a YAML file from which to load the settings.
+    If provided, the settings will be loaded from the nested section under this key.
+    This is useful when the YAML file contains multiple configuration sections
+    and you only want to load a specific subset into your settings model.
     """
 
-    # Note: Many of the below class vars are defined in the metaclass, but we define them here for type checking purposes.
-
-    model_config: ClassVar[ConfigDict] = ConfigDict()
+    pyproject_toml_depth: int
     """
-    Configuration for the model, should be a dictionary conforming to [`ConfigDict`][pydantic.config.ConfigDict].
-    """
+    Number of levels **up** from the current working directory to attempt to find a pyproject.toml
+    file.
 
-    __class_vars__: ClassVar[set[str]]
-    """The names of the class variables defined on the model."""
-
-    __private_attributes__: ClassVar[Dict[str, ModelPrivateAttr]]  # noqa: UP006
-    """Metadata about the private attributes of the model."""
-
-    __signature__: ClassVar[Signature]
-    """The synthesized `__init__` [`Signature`][inspect.Signature] of the model."""
-
-    __pydantic_complete__: ClassVar[bool] = False
-    """Whether model building is completed, or if there are still undefined fields."""
-
-    __pydantic_core_schema__: ClassVar[CoreSchema]
-    """The core schema of the model."""
-
-    __pydantic_custom_init__: ClassVar[bool]
-    """Whether the model has a custom `__init__` method."""
-
-    # Must be set for `GenerateSchema.model_schema` to work for a plain `BaseModel` annotation.
-    __pydantic_decorators__: ClassVar[_decorators.DecoratorInfos] = _decorators.DecoratorInfos()
-    """Metadata containing the decorators defined on the model.
-    This replaces `Model.__validators__` and `Model.__root_validators__` from Pydantic V1."""
-
-    __pydantic_generic_metadata__: ClassVar[_generics.PydanticGenericMetadata]
-    """Metadata for generic models; contains data used for a similar purpose to
-    __args__, __origin__, __parameters__ in typing-module generics. May eventually be replaced by these."""
-
-    __pydantic_parent_namespace__: ClassVar[Dict[str, Any] | None] = None  # noqa: UP006
-    """Parent namespace of the model, used for automatic rebuilding of models."""
-
-    __pydantic_post_init__: ClassVar[None | Literal['model_post_init']]
-    """The name of the post-init method for the model, if defined."""
-
-    __pydantic_root_model__: ClassVar[bool] = False
-    """Whether the model is a [`RootModel`][pydantic.root_model.RootModel]."""
-
-    __pydantic_serializer__: ClassVar[SchemaSerializer]
-    """The `pydantic-core` `SchemaSerializer` used to dump instances of the model."""
-
-    __pydantic_validator__: ClassVar[SchemaValidator | PluggableSchemaValidator]
-    """The `pydantic-core` `SchemaValidator` used to validate instances of the model."""
-
-    __pydantic_fields__: ClassVar[Dict[str, FieldInfo]]  # noqa: UP006
-    """A dictionary of field names and their corresponding [`FieldInfo`][pydantic.fields.FieldInfo] objects.
-    This replaces `Model.__fields__` from Pydantic V1.
+    This is only used when a pyproject.toml file is not found in the current working directory.
     """
 
-    __pydantic_setattr_handlers__: ClassVar[Dict[str, Callable[[BaseModel, str, Any], None]]]  # noqa: UP006
-    """`__setattr__` handlers. Memoizing the handlers leads to a dramatic performance improvement in `__setattr__`"""
+    pyproject_toml_table_header: tuple[str, ...]
+    """
+    Header of the TOML table within a pyproject.toml file to use when filling variables.
+    This is supplied as a `tuple[str, ...]` instead of a `str` to accommodate for headers
+    containing a `.`.
 
-    __pydantic_computed_fields__: ClassVar[Dict[str, ComputedFieldInfo]]  # noqa: UP006
-    """A dictionary of computed field names and their corresponding [`ComputedFieldInfo`][pydantic.fields.ComputedFieldInfo] objects."""
+    For example, `toml_table_header = ("tool", "my.tool", "foo")` can be used to fill variable
+    values from a table with header `[tool."my.tool".foo]`.
 
-    __pydantic_extra__: dict[str, Any] | None = _model_construction.NoInitField(init=False)
-    """A dictionary containing extra values, if [`extra`][pydantic.config.ConfigDict.extra] is set to `'allow'`."""
+    To use the root table, exclude this config setting or provide an empty tuple.
+    """
 
-    __pydantic_fields_set__: set[str] = _model_construction.NoInitField(init=False)
-    """The names of fields explicitly set during instantiation."""
+    toml_file: PathType | None
+    enable_decoding: bool
 
-    __pydantic_private__: dict[str, Any] | None = _model_construction.NoInitField(init=False)
-    """Values of private attributes set on the model instance."""
 
-    if not TYPE_CHECKING:
-        # Prevent `BaseModel` from being instantiated directly
-        # (defined in an `if not TYPE_CHECKING` block for clarity and to avoid type checking errors):
-        __pydantic_core_schema__ = _mock_val_ser.MockCoreSchema(
-            'Pydantic models should inherit from BaseModel, BaseModel cannot be instantiated directly',
-            code='base-model-instantiated',
-        )
-        __pydantic_validator__ = _mock_val_ser.MockValSer(
-            'Pydantic models should inherit from BaseModel, BaseModel cannot be instantiated directly',
-            val_or_ser='validator',
-            code='base-model-instantiated',
-        )
-        __pydantic_serializer__ = _mock_val_ser.MockValSer(
-            'Pydantic models should inherit from BaseModel, BaseModel cannot be instantiated directly',
-            val_or_ser='serializer',
-            code='base-model-instantiated',
-        )
+# Extend `config_keys` by pydantic settings config keys to
+# support setting config through class kwargs.
+# Pydantic uses `config_keys` in `pydantic._internal._config.ConfigWrapper.for_model`
+# to extract config keys from model kwargs, So, by adding pydantic settings keys to
+# `config_keys`, they will be considered as valid config keys and will be collected
+# by Pydantic.
+config_keys |= set(SettingsConfigDict.__annotations__.keys())
 
-    __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
 
-    def __init__(self, /, **data: Any) -> None:
-        """Create a new model by parsing and validating input data from keyword arguments.
+class BaseSettings(BaseModel):
+    """
+    Base class for settings, allowing values to be overridden by environment variables.
 
-        Raises [`ValidationError`][pydantic_core.ValidationError] if the input data cannot be
-        validated to form a valid model.
+    This is useful in production for secrets you do not wish to save in code, it plays nicely with docker(-compose),
+    Heroku and any 12 factor app design.
 
-        `self` is explicitly positional-only to allow `self` as a field name.
-        """
-        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
-        __tracebackhide__ = True
-        validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
-        if self is not validated_self:
-            warnings.warn(
-                'A custom validator is returning a value other than `self`.\n'
-                "Returning anything other than `self` from a top level model validator isn't supported when validating via `__init__`.\n"
-                'See the `model_validator` docs (https://docs.pydantic.dev/latest/concepts/validators/#model-validators) for more details.',
-                stacklevel=2,
-            )
-
-    # The following line sets a flag that we use to determine when `__init__` gets overridden by the user
-    __init__.__pydantic_base_init__ = True  # pyright: ignore[reportFunctionMemberAccess]
-
-    @_utils.deprecated_instance_property
-    @classmethod
-    def model_fields(cls) -> dict[str, FieldInfo]:
-        """A mapping of field names to their respective [`FieldInfo`][pydantic.fields.FieldInfo] instances.
-
-        !!! warning
-            Accessing this attribute from a model instance is deprecated, and will not work in Pydantic V3.
-            Instead, you should access this attribute from the model class.
-        """
-        return getattr(cls, '__pydantic_fields__', {})
-
-    @_utils.deprecated_instance_property
-    @classmethod
-    def model_computed_fields(cls) -> dict[str, ComputedFieldInfo]:
-        """A mapping of computed field names to their respective [`ComputedFieldInfo`][pydantic.fields.ComputedFieldInfo] instances.
-
-        !!! warning
-            Accessing this attribute from a model instance is deprecated, and will not work in Pydantic V3.
-            Instead, you should access this attribute from the model class.
-        """
-        return getattr(cls, '__pydantic_computed_fields__', {})
-
-    @property
-    def model_extra(self) -> dict[str, Any] | None:
-        """Get extra fields set during validation.
-
-        Returns:
-            A dictionary of extra fields, or `None` if `config.extra` is not set to `"allow"`.
-        """
-        return self.__pydantic_extra__
-
-    @property
-    def model_fields_set(self) -> set[str]:
-        """Returns the set of fields that have been explicitly set on this model instance.
-
-        Returns:
-            A set of strings representing the fields that have been set,
-                i.e. that were not filled from defaults.
-        """
-        return self.__pydantic_fields_set__
-
-    @classmethod
-    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:  # noqa: C901
-        """Creates a new instance of the `Model` class with validated data.
-
-        Creates a new model setting `__dict__` and `__pydantic_fields_set__` from trusted or pre-validated data.
-        Default values are respected, but no other validation is performed.
-
-        !!! note
-            `model_construct()` generally respects the `model_config.extra` setting on the provided model.
-            That is, if `model_config.extra == 'allow'`, then all extra passed values are added to the model instance's `__dict__`
-            and `__pydantic_extra__` fields. If `model_config.extra == 'ignore'` (the default), then all extra passed values are ignored.
-            Because no validation is performed with a call to `model_construct()`, having `model_config.extra == 'forbid'` does not result in
-            an error if extra values are passed, but they will be ignored.
-
-        Args:
-            _fields_set: A set of field names that were originally explicitly set during instantiation. If provided,
-                this is directly used for the [`model_fields_set`][pydantic.BaseModel.model_fields_set] attribute.
-                Otherwise, the field names from the `values` argument will be used.
-            values: Trusted or pre-validated data dictionary.
-
-        Returns:
-            A new instance of the `Model` class with validated data.
-        """
-        m = cls.__new__(cls)
-        fields_values: dict[str, Any] = {}
-        fields_set = set()
-
-        for name, field in cls.__pydantic_fields__.items():
-            if field.alias is not None and field.alias in values:
-                fields_values[name] = values.pop(field.alias)
-                fields_set.add(name)
-
-            if (name not in fields_set) and (field.validation_alias is not None):
-                validation_aliases: list[str | AliasPath] = (
-                    field.validation_alias.choices
-                    if isinstance(field.validation_alias, AliasChoices)
-                    else [field.validation_alias]
-                )
-
-                for alias in validation_aliases:
-                    if isinstance(alias, str) and alias in values:
-                        fields_values[name] = values.pop(alias)
-                        fields_set.add(name)
-                        break
-                    elif isinstance(alias, AliasPath):
-                        value = alias.search_dict_for_path(values)
-                        if value is not PydanticUndefined:
-                            fields_values[name] = value
-                            fields_set.add(name)
-                            break
-
-            if name not in fields_set:
-                if name in values:
-                    fields_values[name] = values.pop(name)
-                    fields_set.add(name)
-                elif not field.is_required():
-                    fields_values[name] = field.get_default(call_default_factory=True, validated_data=fields_values)
-        if _fields_set is None:
-            _fields_set = fields_set
-
-        _extra: dict[str, Any] | None = values if cls.model_config.get('extra') == 'allow' else None
-        _object_setattr(m, '__dict__', fields_values)
-        _object_setattr(m, '__pydantic_fields_set__', _fields_set)
-        if not cls.__pydantic_root_model__:
-            _object_setattr(m, '__pydantic_extra__', _extra)
-
-        if cls.__pydantic_post_init__:
-            m.model_post_init(None)
-            # update private attributes with values set
-            if hasattr(m, '__pydantic_private__') and m.__pydantic_private__ is not None:
-                for k, v in values.items():
-                    if k in m.__private_attributes__:
-                        m.__pydantic_private__[k] = v
-
-        elif not cls.__pydantic_root_model__:
-            # Note: if there are any private attributes, cls.__pydantic_post_init__ would exist
-            # Since it doesn't, that means that `__pydantic_private__` should be set to None
-            _object_setattr(m, '__pydantic_private__', None)
-
-        return m
-
-    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
-        """!!! abstract "Usage Documentation"
-            [`model_copy`](../concepts/serialization.md#model_copy)
-
-        Returns a copy of the model.
-
-        !!! note
-            The underlying instance's [`__dict__`][object.__dict__] attribute is copied. This
-            might have unexpected side effects if you store anything in it, on top of the model
-            fields (e.g. the value of [cached properties][functools.cached_property]).
-
-        Args:
-            update: Values to change/add in the new model. Note: the data is not validated
-                before creating the new model. You should trust this data.
-            deep: Set to `True` to make a deep copy of the model.
-
-        Returns:
-            New model instance.
-        """
-        copied = self.__deepcopy__() if deep else self.__copy__()
-        if update:
-            if self.model_config.get('extra') == 'allow':
-                for k, v in update.items():
-                    if k in self.__pydantic_fields__:
-                        copied.__dict__[k] = v
-                    else:
-                        if copied.__pydantic_extra__ is None:
-                            copied.__pydantic_extra__ = {}
-                        copied.__pydantic_extra__[k] = v
-            else:
-                copied.__dict__.update(update)
-            copied.__pydantic_fields_set__.update(update.keys())
-        return copied
-
-    def model_dump(
-        self,
-        *,
-        mode: Literal['json', 'python'] | str = 'python',
-        include: IncEx | None = None,
-        exclude: IncEx | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        exclude_unset: bool = False,
-        exclude_defaults: bool = False,
-        exclude_none: bool = False,
-        round_trip: bool = False,
-        warnings: bool | Literal['none', 'warn', 'error'] = True,
-        fallback: Callable[[Any], Any] | None = None,
-        serialize_as_any: bool = False,
-    ) -> dict[str, Any]:
-        """!!! abstract "Usage Documentation"
-            [`model_dump`](../concepts/serialization.md#modelmodel_dump)
-
-        Generate a dictionary representation of the model, optionally specifying which fields to include or exclude.
-
-        Args:
-            mode: The mode in which `to_python` should run.
-                If mode is 'json', the output will only contain JSON serializable types.
-                If mode is 'python', the output may contain non-JSON-serializable Python objects.
-            include: A set of fields to include in the output.
-            exclude: A set of fields to exclude from the output.
-            context: Additional context to pass to the serializer.
-            by_alias: Whether to use the field's alias in the dictionary key if defined.
-            exclude_unset: Whether to exclude fields that have not been explicitly set.
-            exclude_defaults: Whether to exclude fields that are set to their default value.
-            exclude_none: Whether to exclude fields that have a value of `None`.
-            round_trip: If True, dumped values should be valid as input for non-idempotent types such as Json[T].
-            warnings: How to handle serialization errors. False/"none" ignores them, True/"warn" logs errors,
-                "error" raises a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError].
-            fallback: A function to call when an unknown value is encountered. If not provided,
-                a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError] error is raised.
-            serialize_as_any: Whether to serialize fields with duck-typing serialization behavior.
-
-        Returns:
-            A dictionary representation of the model.
-        """
-        return self.__pydantic_serializer__.to_python(
-            self,
-            mode=mode,
-            by_alias=by_alias,
-            include=include,
-            exclude=exclude,
-            context=context,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
-            round_trip=round_trip,
-            warnings=warnings,
-            fallback=fallback,
-            serialize_as_any=serialize_as_any,
-        )
-
-    def model_dump_json(
-        self,
-        *,
-        indent: int | None = None,
-        include: IncEx | None = None,
-        exclude: IncEx | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        exclude_unset: bool = False,
-        exclude_defaults: bool = False,
-        exclude_none: bool = False,
-        round_trip: bool = False,
-        warnings: bool | Literal['none', 'warn', 'error'] = True,
-        fallback: Callable[[Any], Any] | None = None,
-        serialize_as_any: bool = False,
-    ) -> str:
-        """!!! abstract "Usage Documentation"
-            [`model_dump_json`](../concepts/serialization.md#modelmodel_dump_json)
-
-        Generates a JSON representation of the model using Pydantic's `to_json` method.
-
-        Args:
-            indent: Indentation to use in the JSON output. If None is passed, the output will be compact.
-            include: Field(s) to include in the JSON output.
-            exclude: Field(s) to exclude from the JSON output.
-            context: Additional context to pass to the serializer.
-            by_alias: Whether to serialize using field aliases.
-            exclude_unset: Whether to exclude fields that have not been explicitly set.
-            exclude_defaults: Whether to exclude fields that are set to their default value.
-            exclude_none: Whether to exclude fields that have a value of `None`.
-            round_trip: If True, dumped values should be valid as input for non-idempotent types such as Json[T].
-            warnings: How to handle serialization errors. False/"none" ignores them, True/"warn" logs errors,
-                "error" raises a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError].
-            fallback: A function to call when an unknown value is encountered. If not provided,
-                a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError] error is raised.
-            serialize_as_any: Whether to serialize fields with duck-typing serialization behavior.
-
-        Returns:
-            A JSON string representation of the model.
-        """
-        return self.__pydantic_serializer__.to_json(
-            self,
-            indent=indent,
-            include=include,
-            exclude=exclude,
-            context=context,
-            by_alias=by_alias,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
-            round_trip=round_trip,
-            warnings=warnings,
-            fallback=fallback,
-            serialize_as_any=serialize_as_any,
-        ).decode()
-
-    @classmethod
-    def model_json_schema(
-        cls,
-        by_alias: bool = True,
-        ref_template: str = DEFAULT_REF_TEMPLATE,
-        schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
-        mode: JsonSchemaMode = 'validation',
-    ) -> dict[str, Any]:
-        """Generates a JSON schema for a model class.
-
-        Args:
-            by_alias: Whether to use attribute aliases or not.
-            ref_template: The reference template.
-            schema_generator: To override the logic used to generate the JSON schema, as a subclass of
-                `GenerateJsonSchema` with your desired modifications
-            mode: The mode in which to generate the schema.
-
-        Returns:
-            The JSON schema for the given model class.
-        """
-        return model_json_schema(
-            cls, by_alias=by_alias, ref_template=ref_template, schema_generator=schema_generator, mode=mode
-        )
-
-    @classmethod
-    def model_parametrized_name(cls, params: tuple[type[Any], ...]) -> str:
-        """Compute the class name for parametrizations of generic classes.
-
-        This method can be overridden to achieve a custom naming scheme for generic BaseModels.
-
-        Args:
-            params: Tuple of types of the class. Given a generic class
-                `Model` with 2 type variables and a concrete model `Model[str, int]`,
-                the value `(str, int)` would be passed to `params`.
-
-        Returns:
-            String representing the new class where `params` are passed to `cls` as type variables.
-
-        Raises:
-            TypeError: Raised when trying to generate concrete names for non-generic models.
-        """
-        if not issubclass(cls, typing.Generic):
-            raise TypeError('Concrete names should only be generated for generic models.')
-
-        # Any strings received should represent forward references, so we handle them specially below.
-        # If we eventually move toward wrapping them in a ForwardRef in __class_getitem__ in the future,
-        # we may be able to remove this special case.
-        param_names = [param if isinstance(param, str) else _repr.display_as_type(param) for param in params]
-        params_component = ', '.join(param_names)
-        return f'{cls.__name__}[{params_component}]'
-
-    def model_post_init(self, context: Any, /) -> None:
-        """Override this method to perform additional initialization after `__init__` and `model_construct`.
-        This is useful if you want to do some validation that requires the entire model to be initialized.
-        """
-        pass
-
-    @classmethod
-    def model_rebuild(
-        cls,
-        *,
-        force: bool = False,
-        raise_errors: bool = True,
-        _parent_namespace_depth: int = 2,
-        _types_namespace: MappingNamespace | None = None,
-    ) -> bool | None:
-        """Try to rebuild the pydantic-core schema for the model.
-
-        This may be necessary when one of the annotations is a ForwardRef which could not be resolved during
-        the initial attempt to build the schema, and automatic rebuilding fails.
-
-        Args:
-            force: Whether to force the rebuilding of the model schema, defaults to `False`.
-            raise_errors: Whether to raise errors, defaults to `True`.
-            _parent_namespace_depth: The depth level of the parent namespace, defaults to 2.
-            _types_namespace: The types namespace, defaults to `None`.
-
-        Returns:
-            Returns `None` if the schema is already "complete" and rebuilding was not required.
-            If rebuilding _was_ required, returns `True` if rebuilding was successful, otherwise `False`.
-        """
-        if not force and cls.__pydantic_complete__:
-            return None
-
-        for attr in ('__pydantic_core_schema__', '__pydantic_validator__', '__pydantic_serializer__'):
-            if attr in cls.__dict__ and not isinstance(getattr(cls, attr), _mock_val_ser.MockValSer):
-                # Deleting the validator/serializer is necessary as otherwise they can get reused in
-                # pydantic-core. We do so only if they aren't mock instances, otherwise — as `model_rebuild()`
-                # isn't thread-safe — concurrent model instantiations can lead to the parent validator being used.
-                # Same applies for the core schema that can be reused in schema generation.
-                delattr(cls, attr)
-
-        cls.__pydantic_complete__ = False
-
-        if _types_namespace is not None:
-            rebuild_ns = _types_namespace
-        elif _parent_namespace_depth > 0:
-            rebuild_ns = _typing_extra.parent_frame_namespace(parent_depth=_parent_namespace_depth, force=True) or {}
-        else:
-            rebuild_ns = {}
-
-        parent_ns = _model_construction.unpack_lenient_weakvaluedict(cls.__pydantic_parent_namespace__) or {}
-
-        ns_resolver = _namespace_utils.NsResolver(
-            parent_namespace={**rebuild_ns, **parent_ns},
-        )
-
-        if not cls.__pydantic_fields_complete__:
-            typevars_map = _generics.get_model_typevars_map(cls)
-            try:
-                cls.__pydantic_fields__ = _fields.rebuild_model_fields(
-                    cls,
-                    ns_resolver=ns_resolver,
-                    typevars_map=typevars_map,
-                )
-            except NameError as e:
-                exc = PydanticUndefinedAnnotation.from_name_error(e)
-                _mock_val_ser.set_model_mocks(cls, f'`{exc.name}`')
-                if raise_errors:
-                    raise exc from e
-
-            if not raise_errors and not cls.__pydantic_fields_complete__:
-                # No need to continue with schema gen, it is guaranteed to fail
-                return False
-
-            assert cls.__pydantic_fields_complete__
-
-        return _model_construction.complete_model_class(
-            cls,
-            _config.ConfigWrapper(cls.model_config, check=False),
-            raise_errors=raise_errors,
-            ns_resolver=ns_resolver,
-        )
-
-    @classmethod
-    def model_validate(
-        cls,
-        obj: Any,
-        *,
-        strict: bool | None = None,
-        from_attributes: bool | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        by_name: bool | None = None,
-    ) -> Self:
-        """Validate a pydantic model instance.
-
-        Args:
-            obj: The object to validate.
-            strict: Whether to enforce types strictly.
-            from_attributes: Whether to extract data from object attributes.
-            context: Additional context to pass to the validator.
-            by_alias: Whether to use the field's alias when validating against the provided input data.
-            by_name: Whether to use the field's name when validating against the provided input data.
-
-        Raises:
-            ValidationError: If the object could not be validated.
-
-        Returns:
-            The validated model instance.
-        """
-        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
-        __tracebackhide__ = True
-
-        if by_alias is False and by_name is not True:
-            raise PydanticUserError(
-                'At least one of `by_alias` or `by_name` must be set to True.',
-                code='validate-by-alias-and-name-false',
-            )
-
-        return cls.__pydantic_validator__.validate_python(
-            obj, strict=strict, from_attributes=from_attributes, context=context, by_alias=by_alias, by_name=by_name
-        )
-
-    @classmethod
-    def model_validate_json(
-        cls,
-        json_data: str | bytes | bytearray,
-        *,
-        strict: bool | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        by_name: bool | None = None,
-    ) -> Self:
-        """!!! abstract "Usage Documentation"
-            [JSON Parsing](../concepts/json.md#json-parsing)
-
-        Validate the given JSON data against the Pydantic model.
-
-        Args:
-            json_data: The JSON data to validate.
-            strict: Whether to enforce types strictly.
-            context: Extra variables to pass to the validator.
-            by_alias: Whether to use the field's alias when validating against the provided input data.
-            by_name: Whether to use the field's name when validating against the provided input data.
-
-        Returns:
-            The validated Pydantic model.
-
-        Raises:
-            ValidationError: If `json_data` is not a JSON string or the object could not be validated.
-        """
-        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
-        __tracebackhide__ = True
-
-        if by_alias is False and by_name is not True:
-            raise PydanticUserError(
-                'At least one of `by_alias` or `by_name` must be set to True.',
-                code='validate-by-alias-and-name-false',
-            )
-
-        return cls.__pydantic_validator__.validate_json(
-            json_data, strict=strict, context=context, by_alias=by_alias, by_name=by_name
-        )
-
-    @classmethod
-    def model_validate_strings(
-        cls,
-        obj: Any,
-        *,
-        strict: bool | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        by_name: bool | None = None,
-    ) -> Self:
-        """Validate the given object with string data against the Pydantic model.
-
-        Args:
-            obj: The object containing string data to validate.
-            strict: Whether to enforce types strictly.
-            context: Extra variables to pass to the validator.
-            by_alias: Whether to use the field's alias when validating against the provided input data.
-            by_name: Whether to use the field's name when validating against the provided input data.
-
-        Returns:
-            The validated Pydantic model.
-        """
-        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
-        __tracebackhide__ = True
-
-        if by_alias is False and by_name is not True:
-            raise PydanticUserError(
-                'At least one of `by_alias` or `by_name` must be set to True.',
-                code='validate-by-alias-and-name-false',
-            )
-
-        return cls.__pydantic_validator__.validate_strings(
-            obj, strict=strict, context=context, by_alias=by_alias, by_name=by_name
-        )
-
-    @classmethod
-    def __get_pydantic_core_schema__(cls, source: type[BaseModel], handler: GetCoreSchemaHandler, /) -> CoreSchema:
-        # This warning is only emitted when calling `super().__get_pydantic_core_schema__` from a model subclass.
-        # In the generate schema logic, this method (`BaseModel.__get_pydantic_core_schema__`) is special cased to
-        # *not* be called if not overridden.
-        warnings.warn(
-            'The `__get_pydantic_core_schema__` method of the `BaseModel` class is deprecated. If you are calling '
-            '`super().__get_pydantic_core_schema__` when overriding the method on a Pydantic model, consider using '
-            '`handler(source)` instead. However, note that overriding this method on models can lead to unexpected '
-            'side effects.',
-            PydanticDeprecatedSince211,
-            stacklevel=2,
-        )
-        # Logic copied over from `GenerateSchema._model_schema`:
-        schema = cls.__dict__.get('__pydantic_core_schema__')
-        if schema is not None and not isinstance(schema, _mock_val_ser.MockCoreSchema):
-            return cls.__pydantic_core_schema__
-
-        return handler(source)
-
-    @classmethod
-    def __get_pydantic_json_schema__(
-        cls,
-        core_schema: CoreSchema,
-        handler: GetJsonSchemaHandler,
-        /,
-    ) -> JsonSchemaValue:
-        """Hook into generating the model's JSON schema.
-
-        Args:
-            core_schema: A `pydantic-core` CoreSchema.
-                You can ignore this argument and call the handler with a new CoreSchema,
-                wrap this CoreSchema (`{'type': 'nullable', 'schema': current_schema}`),
-                or just call the handler with the original schema.
-            handler: Call into Pydantic's internal JSON schema generation.
-                This will raise a `pydantic.errors.PydanticInvalidForJsonSchema` if JSON schema
-                generation fails.
-                Since this gets called by `BaseModel.model_json_schema` you can override the
-                `schema_generator` argument to that function to change JSON schema generation globally
-                for a type.
-
-        Returns:
-            A JSON schema, as a Python object.
-        """
-        return handler(core_schema)
-
-    @classmethod
-    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
-        """This is intended to behave just like `__init_subclass__`, but is called by `ModelMetaclass`
-        only after the class is actually fully initialized. In particular, attributes like `model_fields` will
-        be present when this is called.
-
-        This is necessary because `__init_subclass__` will always be called by `type.__new__`,
-        and it would require a prohibitively large refactor to the `ModelMetaclass` to ensure that
-        `type.__new__` was called in such a manner that the class would already be sufficiently initialized.
-
-        This will receive the same `kwargs` that would be passed to the standard `__init_subclass__`, namely,
-        any kwargs passed to the class definition that aren't used internally by pydantic.
-
-        Args:
-            **kwargs: Any keyword arguments passed to the class definition that aren't used internally
-                by pydantic.
-        """
-        pass
-
-    def __class_getitem__(
-        cls, typevar_values: type[Any] | tuple[type[Any], ...]
-    ) -> type[BaseModel] | _forward_ref.PydanticRecursiveRef:
-        cached = _generics.get_cached_generic_type_early(cls, typevar_values)
-        if cached is not None:
-            return cached
-
-        if cls is BaseModel:
-            raise TypeError('Type parameters should be placed on typing.Generic, not BaseModel')
-        if not hasattr(cls, '__parameters__'):
-            raise TypeError(f'{cls} cannot be parametrized because it does not inherit from typing.Generic')
-        if not cls.__pydantic_generic_metadata__['parameters'] and typing.Generic not in cls.__bases__:
-            raise TypeError(f'{cls} is not a generic class')
-
-        if not isinstance(typevar_values, tuple):
-            typevar_values = (typevar_values,)
-
-        # For a model `class Model[T, U, V = int](BaseModel): ...` parametrized with `(str, bool)`,
-        # this gives us `{T: str, U: bool, V: int}`:
-        typevars_map = _generics.map_generic_model_arguments(cls, typevar_values)
-        # We also update the provided args to use defaults values (`(str, bool)` becomes `(str, bool, int)`):
-        typevar_values = tuple(v for v in typevars_map.values())
-
-        if _utils.all_identical(typevars_map.keys(), typevars_map.values()) and typevars_map:
-            submodel = cls  # if arguments are equal to parameters it's the same object
-            _generics.set_cached_generic_type(cls, typevar_values, submodel)
-        else:
-            parent_args = cls.__pydantic_generic_metadata__['args']
-            if not parent_args:
-                args = typevar_values
-            else:
-                args = tuple(_generics.replace_types(arg, typevars_map) for arg in parent_args)
-
-            origin = cls.__pydantic_generic_metadata__['origin'] or cls
-            model_name = origin.model_parametrized_name(args)
-            params = tuple(
-                {param: None for param in _generics.iter_contained_typevars(typevars_map.values())}
-            )  # use dict as ordered set
-
-            with _generics.generic_recursion_self_type(origin, args) as maybe_self_type:
-                cached = _generics.get_cached_generic_type_late(cls, typevar_values, origin, args)
-                if cached is not None:
-                    return cached
-
-                if maybe_self_type is not None:
-                    return maybe_self_type
-
-                # Attempt to rebuild the origin in case new types have been defined
-                try:
-                    # depth 2 gets you above this __class_getitem__ call.
-                    # Note that we explicitly provide the parent ns, otherwise
-                    # `model_rebuild` will use the parent ns no matter if it is the ns of a module.
-                    # We don't want this here, as this has unexpected effects when a model
-                    # is being parametrized during a forward annotation evaluation.
-                    parent_ns = _typing_extra.parent_frame_namespace(parent_depth=2) or {}
-                    origin.model_rebuild(_types_namespace=parent_ns)
-                except PydanticUndefinedAnnotation:
-                    # It's okay if it fails, it just means there are still undefined types
-                    # that could be evaluated later.
-                    pass
-
-                submodel = _generics.create_generic_submodel(model_name, origin, args, params)
-
-                _generics.set_cached_generic_type(cls, typevar_values, submodel, origin, args)
-
-        return submodel
-
-    def __copy__(self) -> Self:
-        """Returns a shallow copy of the model."""
-        cls = type(self)
-        m = cls.__new__(cls)
-        _object_setattr(m, '__dict__', copy(self.__dict__))
-        _object_setattr(m, '__pydantic_extra__', copy(self.__pydantic_extra__))
-        _object_setattr(m, '__pydantic_fields_set__', copy(self.__pydantic_fields_set__))
-
-        if not hasattr(self, '__pydantic_private__') or self.__pydantic_private__ is None:
-            _object_setattr(m, '__pydantic_private__', None)
-        else:
-            _object_setattr(
-                m,
-                '__pydantic_private__',
-                {k: v for k, v in self.__pydantic_private__.items() if v is not PydanticUndefined},
-            )
-
-        return m
-
-    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
-        """Returns a deep copy of the model."""
-        cls = type(self)
-        m = cls.__new__(cls)
-        _object_setattr(m, '__dict__', deepcopy(self.__dict__, memo=memo))
-        _object_setattr(m, '__pydantic_extra__', deepcopy(self.__pydantic_extra__, memo=memo))
-        # This next line doesn't need a deepcopy because __pydantic_fields_set__ is a set[str],
-        # and attempting a deepcopy would be marginally slower.
-        _object_setattr(m, '__pydantic_fields_set__', copy(self.__pydantic_fields_set__))
-
-        if not hasattr(self, '__pydantic_private__') or self.__pydantic_private__ is None:
-            _object_setattr(m, '__pydantic_private__', None)
-        else:
-            _object_setattr(
-                m,
-                '__pydantic_private__',
-                deepcopy({k: v for k, v in self.__pydantic_private__.items() if v is not PydanticUndefined}, memo=memo),
-            )
-
-        return m
-
-    if not TYPE_CHECKING:
-        # We put `__getattr__` in a non-TYPE_CHECKING block because otherwise, mypy allows arbitrary attribute access
-        # The same goes for __setattr__ and __delattr__, see: https://github.com/pydantic/pydantic/issues/8643
-
-        def __getattr__(self, item: str) -> Any:
-            private_attributes = object.__getattribute__(self, '__private_attributes__')
-            if item in private_attributes:
-                attribute = private_attributes[item]
-                if hasattr(attribute, '__get__'):
-                    return attribute.__get__(self, type(self))  # type: ignore
-
-                try:
-                    # Note: self.__pydantic_private__ cannot be None if self.__private_attributes__ has items
-                    return self.__pydantic_private__[item]  # type: ignore
-                except KeyError as exc:
-                    raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}') from exc
-            else:
-                # `__pydantic_extra__` can fail to be set if the model is not yet fully initialized.
-                # See `BaseModel.__repr_args__` for more details
-                try:
-                    pydantic_extra = object.__getattribute__(self, '__pydantic_extra__')
-                except AttributeError:
-                    pydantic_extra = None
-
-                if pydantic_extra:
-                    try:
-                        return pydantic_extra[item]
-                    except KeyError as exc:
-                        raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}') from exc
-                else:
-                    if hasattr(self.__class__, item):
-                        return super().__getattribute__(item)  # Raises AttributeError if appropriate
-                    else:
-                        # this is the current error
-                        raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
-
-        def __setattr__(self, name: str, value: Any) -> None:
-            if (setattr_handler := self.__pydantic_setattr_handlers__.get(name)) is not None:
-                setattr_handler(self, name, value)
-            # if None is returned from _setattr_handler, the attribute was set directly
-            elif (setattr_handler := self._setattr_handler(name, value)) is not None:
-                setattr_handler(self, name, value)  # call here to not memo on possibly unknown fields
-                self.__pydantic_setattr_handlers__[name] = setattr_handler  # memoize the handler for faster access
-
-        def _setattr_handler(self, name: str, value: Any) -> Callable[[BaseModel, str, Any], None] | None:
-            """Get a handler for setting an attribute on the model instance.
-
-            Returns:
-                A handler for setting an attribute on the model instance. Used for memoization of the handler.
-                Memoizing the handlers leads to a dramatic performance improvement in `__setattr__`
-                Returns `None` when memoization is not safe, then the attribute is set directly.
-            """
-            cls = self.__class__
-            if name in cls.__class_vars__:
-                raise AttributeError(
-                    f'{name!r} is a ClassVar of `{cls.__name__}` and cannot be set on an instance. '
-                    f'If you want to set a value on the class, use `{cls.__name__}.{name} = value`.'
-                )
-            elif not _fields.is_valid_field_name(name):
-                if (attribute := cls.__private_attributes__.get(name)) is not None:
-                    if hasattr(attribute, '__set__'):
-                        return lambda model, _name, val: attribute.__set__(model, val)
-                    else:
-                        return _SIMPLE_SETATTR_HANDLERS['private']
-                else:
-                    _object_setattr(self, name, value)
-                    return None  # Can not return memoized handler with possibly freeform attr names
-
-            attr = getattr(cls, name, None)
-            # NOTE: We currently special case properties and `cached_property`, but we might need
-            # to generalize this to all data/non-data descriptors at some point. For non-data descriptors
-            # (such as `cached_property`), it isn't obvious though. `cached_property` caches the value
-            # to the instance's `__dict__`, but other non-data descriptors might do things differently.
-            if isinstance(attr, cached_property):
-                return _SIMPLE_SETATTR_HANDLERS['cached_property']
-
-            _check_frozen(cls, name, value)
-
-            # We allow properties to be set only on non frozen models for now (to match dataclasses).
-            # This can be changed if it ever gets requested.
-            if isinstance(attr, property):
-                return lambda model, _name, val: attr.__set__(model, val)
-            elif cls.model_config.get('validate_assignment'):
-                return _SIMPLE_SETATTR_HANDLERS['validate_assignment']
-            elif name not in cls.__pydantic_fields__:
-                if cls.model_config.get('extra') != 'allow':
-                    # TODO - matching error
-                    raise ValueError(f'"{cls.__name__}" object has no field "{name}"')
-                elif attr is None:
-                    # attribute does not exist, so put it in extra
-                    self.__pydantic_extra__[name] = value
-                    return None  # Can not return memoized handler with possibly freeform attr names
-                else:
-                    # attribute _does_ exist, and was not in extra, so update it
-                    return _SIMPLE_SETATTR_HANDLERS['extra_known']
-            else:
-                return _SIMPLE_SETATTR_HANDLERS['model_field']
-
-        def __delattr__(self, item: str) -> Any:
-            cls = self.__class__
-
-            if item in self.__private_attributes__:
-                attribute = self.__private_attributes__[item]
-                if hasattr(attribute, '__delete__'):
-                    attribute.__delete__(self)  # type: ignore
-                    return
-
-                try:
-                    # Note: self.__pydantic_private__ cannot be None if self.__private_attributes__ has items
-                    del self.__pydantic_private__[item]  # type: ignore
-                    return
-                except KeyError as exc:
-                    raise AttributeError(f'{cls.__name__!r} object has no attribute {item!r}') from exc
-
-            # Allow cached properties to be deleted (even if the class is frozen):
-            attr = getattr(cls, item, None)
-            if isinstance(attr, cached_property):
-                return object.__delattr__(self, item)
-
-            _check_frozen(cls, name=item, value=None)
-
-            if item in self.__pydantic_fields__:
-                object.__delattr__(self, item)
-            elif self.__pydantic_extra__ is not None and item in self.__pydantic_extra__:
-                del self.__pydantic_extra__[item]
-            else:
-                try:
-                    object.__delattr__(self, item)
-                except AttributeError:
-                    raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
-
-        # Because we make use of `@dataclass_transform()`, `__replace__` is already synthesized by
-        # type checkers, so we define the implementation in this `if not TYPE_CHECKING:` block:
-        def __replace__(self, **changes: Any) -> Self:
-            return self.model_copy(update=changes)
-
-    def __getstate__(self) -> dict[Any, Any]:
-        private = self.__pydantic_private__
-        if private:
-            private = {k: v for k, v in private.items() if v is not PydanticUndefined}
-        return {
-            '__dict__': self.__dict__,
-            '__pydantic_extra__': self.__pydantic_extra__,
-            '__pydantic_fields_set__': self.__pydantic_fields_set__,
-            '__pydantic_private__': private,
-        }
-
-    def __setstate__(self, state: dict[Any, Any]) -> None:
-        _object_setattr(self, '__pydantic_fields_set__', state.get('__pydantic_fields_set__', {}))
-        _object_setattr(self, '__pydantic_extra__', state.get('__pydantic_extra__', {}))
-        _object_setattr(self, '__pydantic_private__', state.get('__pydantic_private__', {}))
-        _object_setattr(self, '__dict__', state.get('__dict__', {}))
-
-    if not TYPE_CHECKING:
-
-        def __eq__(self, other: Any) -> bool:
-            if isinstance(other, BaseModel):
-                # When comparing instances of generic types for equality, as long as all field values are equal,
-                # only require their generic origin types to be equal, rather than exact type equality.
-                # This prevents headaches like MyGeneric(x=1) != MyGeneric[Any](x=1).
-                self_type = self.__pydantic_generic_metadata__['origin'] or self.__class__
-                other_type = other.__pydantic_generic_metadata__['origin'] or other.__class__
-
-                # Perform common checks first
-                if not (
-                    self_type == other_type
-                    and getattr(self, '__pydantic_private__', None) == getattr(other, '__pydantic_private__', None)
-                    and self.__pydantic_extra__ == other.__pydantic_extra__
-                ):
-                    return False
-
-                # We only want to compare pydantic fields but ignoring fields is costly.
-                # We'll perform a fast check first, and fallback only when needed
-                # See GH-7444 and GH-7825 for rationale and a performance benchmark
-
-                # First, do the fast (and sometimes faulty) __dict__ comparison
-                if self.__dict__ == other.__dict__:
-                    # If the check above passes, then pydantic fields are equal, we can return early
-                    return True
-
-                # We don't want to trigger unnecessary costly filtering of __dict__ on all unequal objects, so we return
-                # early if there are no keys to ignore (we would just return False later on anyway)
-                model_fields = type(self).__pydantic_fields__.keys()
-                if self.__dict__.keys() <= model_fields and other.__dict__.keys() <= model_fields:
-                    return False
-
-                # If we reach here, there are non-pydantic-fields keys, mapped to unequal values, that we need to ignore
-                # Resort to costly filtering of the __dict__ objects
-                # We use operator.itemgetter because it is much faster than dict comprehensions
-                # NOTE: Contrary to standard python class and instances, when the Model class has a default value for an
-                # attribute and the model instance doesn't have a corresponding attribute, accessing the missing attribute
-                # raises an error in BaseModel.__getattr__ instead of returning the class attribute
-                # So we can use operator.itemgetter() instead of operator.attrgetter()
-                getter = operator.itemgetter(*model_fields) if model_fields else lambda _: _utils._SENTINEL
-                try:
-                    return getter(self.__dict__) == getter(other.__dict__)
-                except KeyError:
-                    # In rare cases (such as when using the deprecated BaseModel.copy() method),
-                    # the __dict__ may not contain all model fields, which is how we can get here.
-                    # getter(self.__dict__) is much faster than any 'safe' method that accounts
-                    # for missing keys, and wrapping it in a `try` doesn't slow things down much
-                    # in the common case.
-                    self_fields_proxy = _utils.SafeGetItemProxy(self.__dict__)
-                    other_fields_proxy = _utils.SafeGetItemProxy(other.__dict__)
-                    return getter(self_fields_proxy) == getter(other_fields_proxy)
-
-            # other instance is not a BaseModel
-            else:
-                return NotImplemented  # delegate to the other item in the comparison
-
-    if TYPE_CHECKING:
-        # We put `__init_subclass__` in a TYPE_CHECKING block because, even though we want the type-checking benefits
-        # described in the signature of `__init_subclass__` below, we don't want to modify the default behavior of
-        # subclass initialization.
-
-        def __init_subclass__(cls, **kwargs: Unpack[ConfigDict]):
-            """This signature is included purely to help type-checkers check arguments to class declaration, which
-            provides a way to conveniently set model_config key/value pairs.
-
-            ```python
-            from pydantic import BaseModel
-
-            class MyModel(BaseModel, extra='allow'): ...
-            ```
-
-            However, this may be deceiving, since the _actual_ calls to `__init_subclass__` will not receive any
-            of the config arguments, and will only receive any keyword arguments passed during class initialization
-            that are _not_ expected keys in ConfigDict. (This is due to the way `ModelMetaclass.__new__` works.)
-
-            Args:
-                **kwargs: Keyword arguments passed to the class definition, which set model_config
-
-            Note:
-                You may want to override `__pydantic_init_subclass__` instead, which behaves similarly but is called
-                *after* the class is fully initialized.
-            """
-
-    def __iter__(self) -> TupleGenerator:
-        """So `dict(model)` works."""
-        yield from [(k, v) for (k, v) in self.__dict__.items() if not k.startswith('_')]
-        extra = self.__pydantic_extra__
-        if extra:
-            yield from extra.items()
-
-    def __repr__(self) -> str:
-        return f'{self.__repr_name__()}({self.__repr_str__(", ")})'
-
-    def __repr_args__(self) -> _repr.ReprArgs:
-        # Eagerly create the repr of computed fields, as this may trigger access of cached properties and as such
-        # modify the instance's `__dict__`. If we don't do it now, it could happen when iterating over the `__dict__`
-        # below if the instance happens to be referenced in a field, and would modify the `__dict__` size *during* iteration.
-        computed_fields_repr_args = [
-            (k, getattr(self, k)) for k, v in self.__pydantic_computed_fields__.items() if v.repr
-        ]
-
-        for k, v in self.__dict__.items():
-            field = self.__pydantic_fields__.get(k)
-            if field and field.repr:
-                if v is not self:
-                    yield k, v
-                else:
-                    yield k, self.__repr_recursion__(v)
-        # `__pydantic_extra__` can fail to be set if the model is not yet fully initialized.
-        # This can happen if a `ValidationError` is raised during initialization and the instance's
-        # repr is generated as part of the exception handling. Therefore, we use `getattr` here
-        # with a fallback, even though the type hints indicate the attribute will always be present.
-        try:
-            pydantic_extra = object.__getattribute__(self, '__pydantic_extra__')
-        except AttributeError:
-            pydantic_extra = None
-
-        if pydantic_extra is not None:
-            yield from ((k, v) for k, v in pydantic_extra.items())
-        yield from computed_fields_repr_args
-
-    # take logic from `_repr.Representation` without the side effects of inheritance, see #5740
-    __repr_name__ = _repr.Representation.__repr_name__
-    __repr_recursion__ = _repr.Representation.__repr_recursion__
-    __repr_str__ = _repr.Representation.__repr_str__
-    __pretty__ = _repr.Representation.__pretty__
-    __rich_repr__ = _repr.Representation.__rich_repr__
-
-    def __str__(self) -> str:
-        return self.__repr_str__(' ')
-
-    # ##### Deprecated methods from v1 #####
-    @property
-    @typing_extensions.deprecated(
-        'The `__fields__` attribute is deprecated, use `model_fields` instead.', category=None
-    )
-    def __fields__(self) -> dict[str, FieldInfo]:
-        warnings.warn(
-            'The `__fields__` attribute is deprecated, use `model_fields` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return getattr(type(self), '__pydantic_fields__', {})
-
-    @property
-    @typing_extensions.deprecated(
-        'The `__fields_set__` attribute is deprecated, use `model_fields_set` instead.',
-        category=None,
-    )
-    def __fields_set__(self) -> set[str]:
-        warnings.warn(
-            'The `__fields_set__` attribute is deprecated, use `model_fields_set` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return self.__pydantic_fields_set__
-
-    @typing_extensions.deprecated('The `dict` method is deprecated; use `model_dump` instead.', category=None)
-    def dict(  # noqa: D102
-        self,
-        *,
-        include: IncEx | None = None,
-        exclude: IncEx | None = None,
-        by_alias: bool = False,
-        exclude_unset: bool = False,
-        exclude_defaults: bool = False,
-        exclude_none: bool = False,
-    ) -> Dict[str, Any]:  # noqa UP006
-        warnings.warn(
-            'The `dict` method is deprecated; use `model_dump` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return self.model_dump(
-            include=include,
-            exclude=exclude,
-            by_alias=by_alias,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
-        )
-
-    @typing_extensions.deprecated('The `json` method is deprecated; use `model_dump_json` instead.', category=None)
-    def json(  # noqa: D102
-        self,
-        *,
-        include: IncEx | None = None,
-        exclude: IncEx | None = None,
-        by_alias: bool = False,
-        exclude_unset: bool = False,
-        exclude_defaults: bool = False,
-        exclude_none: bool = False,
-        encoder: Callable[[Any], Any] | None = PydanticUndefined,  # type: ignore[assignment]
-        models_as_dict: bool = PydanticUndefined,  # type: ignore[assignment]
-        **dumps_kwargs: Any,
-    ) -> str:
-        warnings.warn(
-            'The `json` method is deprecated; use `model_dump_json` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        if encoder is not PydanticUndefined:
-            raise TypeError('The `encoder` argument is no longer supported; use field serializers instead.')
-        if models_as_dict is not PydanticUndefined:
-            raise TypeError('The `models_as_dict` argument is no longer supported; use a model serializer instead.')
-        if dumps_kwargs:
-            raise TypeError('`dumps_kwargs` keyword arguments are no longer supported.')
-        return self.model_dump_json(
-            include=include,
-            exclude=exclude,
-            by_alias=by_alias,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
-        )
-
-    @classmethod
-    @typing_extensions.deprecated('The `parse_obj` method is deprecated; use `model_validate` instead.', category=None)
-    def parse_obj(cls, obj: Any) -> Self:  # noqa: D102
-        warnings.warn(
-            'The `parse_obj` method is deprecated; use `model_validate` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return cls.model_validate(obj)
-
-    @classmethod
-    @typing_extensions.deprecated(
-        'The `parse_raw` method is deprecated; if your data is JSON use `model_validate_json`, '
-        'otherwise load the data then use `model_validate` instead.',
-        category=None,
-    )
-    def parse_raw(  # noqa: D102
-        cls,
-        b: str | bytes,
-        *,
-        content_type: str | None = None,
-        encoding: str = 'utf8',
-        proto: DeprecatedParseProtocol | None = None,
-        allow_pickle: bool = False,
-    ) -> Self:  # pragma: no cover
-        warnings.warn(
-            'The `parse_raw` method is deprecated; if your data is JSON use `model_validate_json`, '
-            'otherwise load the data then use `model_validate` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import parse
-
-        try:
-            obj = parse.load_str_bytes(
-                b,
-                proto=proto,
-                content_type=content_type,
-                encoding=encoding,
-                allow_pickle=allow_pickle,
-            )
-        except (ValueError, TypeError) as exc:
-            import json
-
-            # try to match V1
-            if isinstance(exc, UnicodeDecodeError):
-                type_str = 'value_error.unicodedecode'
-            elif isinstance(exc, json.JSONDecodeError):
-                type_str = 'value_error.jsondecode'
-            elif isinstance(exc, ValueError):
-                type_str = 'value_error'
-            else:
-                type_str = 'type_error'
-
-            # ctx is missing here, but since we've added `input` to the error, we're not pretending it's the same
-            error: pydantic_core.InitErrorDetails = {
-                # The type: ignore on the next line is to ignore the requirement of LiteralString
-                'type': pydantic_core.PydanticCustomError(type_str, str(exc)),  # type: ignore
-                'loc': ('__root__',),
-                'input': b,
-            }
-            raise pydantic_core.ValidationError.from_exception_data(cls.__name__, [error])
-        return cls.model_validate(obj)
-
-    @classmethod
-    @typing_extensions.deprecated(
-        'The `parse_file` method is deprecated; load the data from file, then if your data is JSON '
-        'use `model_validate_json`, otherwise `model_validate` instead.',
-        category=None,
-    )
-    def parse_file(  # noqa: D102
-        cls,
-        path: str | Path,
-        *,
-        content_type: str | None = None,
-        encoding: str = 'utf8',
-        proto: DeprecatedParseProtocol | None = None,
-        allow_pickle: bool = False,
-    ) -> Self:
-        warnings.warn(
-            'The `parse_file` method is deprecated; load the data from file, then if your data is JSON '
-            'use `model_validate_json`, otherwise `model_validate` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import parse
-
-        obj = parse.load_file(
-            path,
-            proto=proto,
-            content_type=content_type,
-            encoding=encoding,
-            allow_pickle=allow_pickle,
-        )
-        return cls.parse_obj(obj)
-
-    @classmethod
-    @typing_extensions.deprecated(
-        'The `from_orm` method is deprecated; set '
-        "`model_config['from_attributes']=True` and use `model_validate` instead.",
-        category=None,
-    )
-    def from_orm(cls, obj: Any) -> Self:  # noqa: D102
-        warnings.warn(
-            'The `from_orm` method is deprecated; set '
-            "`model_config['from_attributes']=True` and use `model_validate` instead.",
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        if not cls.model_config.get('from_attributes', None):
-            raise PydanticUserError(
-                'You must set the config attribute `from_attributes=True` to use from_orm', code=None
-            )
-        return cls.model_validate(obj)
-
-    @classmethod
-    @typing_extensions.deprecated('The `construct` method is deprecated; use `model_construct` instead.', category=None)
-    def construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:  # noqa: D102
-        warnings.warn(
-            'The `construct` method is deprecated; use `model_construct` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return cls.model_construct(_fields_set=_fields_set, **values)
-
-    @typing_extensions.deprecated(
-        'The `copy` method is deprecated; use `model_copy` instead. '
-        'See the docstring of `BaseModel.copy` for details about how to handle `include` and `exclude`.',
-        category=None,
-    )
-    def copy(
-        self,
-        *,
-        include: AbstractSetIntStr | MappingIntStrAny | None = None,
-        exclude: AbstractSetIntStr | MappingIntStrAny | None = None,
-        update: Dict[str, Any] | None = None,  # noqa UP006
-        deep: bool = False,
-    ) -> Self:  # pragma: no cover
-        """Returns a copy of the model.
-
-        !!! warning "Deprecated"
-            This method is now deprecated; use `model_copy` instead.
-
-        If you need `include` or `exclude`, use:
-
-        ```python {test="skip" lint="skip"}
-        data = self.model_dump(include=include, exclude=exclude, round_trip=True)
-        data = {**data, **(update or {})}
-        copied = self.model_validate(data)
-        ```
-
-        Args:
-            include: Optional set or mapping specifying which fields to include in the copied model.
-            exclude: Optional set or mapping specifying which fields to exclude in the copied model.
-            update: Optional dictionary of field-value pairs to override field values in the copied model.
-            deep: If True, the values of fields that are Pydantic models will be deep-copied.
-
-        Returns:
-            A copy of the model with included, excluded and updated fields as specified.
-        """
-        warnings.warn(
-            'The `copy` method is deprecated; use `model_copy` instead. '
-            'See the docstring of `BaseModel.copy` for details about how to handle `include` and `exclude`.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import copy_internals
-
-        values = dict(
-            copy_internals._iter(
-                self, to_dict=False, by_alias=False, include=include, exclude=exclude, exclude_unset=False
-            ),
-            **(update or {}),
-        )
-        if self.__pydantic_private__ is None:
-            private = None
-        else:
-            private = {k: v for k, v in self.__pydantic_private__.items() if v is not PydanticUndefined}
-
-        if self.__pydantic_extra__ is None:
-            extra: dict[str, Any] | None = None
-        else:
-            extra = self.__pydantic_extra__.copy()
-            for k in list(self.__pydantic_extra__):
-                if k not in values:  # k was in the exclude
-                    extra.pop(k)
-            for k in list(values):
-                if k in self.__pydantic_extra__:  # k must have come from extra
-                    extra[k] = values.pop(k)
-
-        # new `__pydantic_fields_set__` can have unset optional fields with a set value in `update` kwarg
-        if update:
-            fields_set = self.__pydantic_fields_set__ | update.keys()
-        else:
-            fields_set = set(self.__pydantic_fields_set__)
-
-        # removing excluded fields from `__pydantic_fields_set__`
-        if exclude:
-            fields_set -= set(exclude)
-
-        return copy_internals._copy_and_set_values(self, values, fields_set, extra, private, deep=deep)
-
-    @classmethod
-    @typing_extensions.deprecated('The `schema` method is deprecated; use `model_json_schema` instead.', category=None)
-    def schema(  # noqa: D102
-        cls, by_alias: bool = True, ref_template: str = DEFAULT_REF_TEMPLATE
-    ) -> Dict[str, Any]:  # noqa UP006
-        warnings.warn(
-            'The `schema` method is deprecated; use `model_json_schema` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return cls.model_json_schema(by_alias=by_alias, ref_template=ref_template)
-
-    @classmethod
-    @typing_extensions.deprecated(
-        'The `schema_json` method is deprecated; use `model_json_schema` and json.dumps instead.',
-        category=None,
-    )
-    def schema_json(  # noqa: D102
-        cls, *, by_alias: bool = True, ref_template: str = DEFAULT_REF_TEMPLATE, **dumps_kwargs: Any
-    ) -> str:  # pragma: no cover
-        warnings.warn(
-            'The `schema_json` method is deprecated; use `model_json_schema` and json.dumps instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        import json
-
-        from .deprecated.json import pydantic_encoder
-
-        return json.dumps(
-            cls.model_json_schema(by_alias=by_alias, ref_template=ref_template),
-            default=pydantic_encoder,
-            **dumps_kwargs,
-        )
-
-    @classmethod
-    @typing_extensions.deprecated('The `validate` method is deprecated; use `model_validate` instead.', category=None)
-    def validate(cls, value: Any) -> Self:  # noqa: D102
-        warnings.warn(
-            'The `validate` method is deprecated; use `model_validate` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return cls.model_validate(value)
-
-    @classmethod
-    @typing_extensions.deprecated(
-        'The `update_forward_refs` method is deprecated; use `model_rebuild` instead.',
-        category=None,
-    )
-    def update_forward_refs(cls, **localns: Any) -> None:  # noqa: D102
-        warnings.warn(
-            'The `update_forward_refs` method is deprecated; use `model_rebuild` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        if localns:  # pragma: no cover
-            raise TypeError('`localns` arguments are not longer accepted.')
-        cls.model_rebuild(force=True)
-
-    @typing_extensions.deprecated(
-        'The private method `_iter` will be removed and should no longer be used.', category=None
-    )
-    def _iter(self, *args: Any, **kwargs: Any) -> Any:
-        warnings.warn(
-            'The private method `_iter` will be removed and should no longer be used.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import copy_internals
-
-        return copy_internals._iter(self, *args, **kwargs)
-
-    @typing_extensions.deprecated(
-        'The private method `_copy_and_set_values` will be removed and should no longer be used.',
-        category=None,
-    )
-    def _copy_and_set_values(self, *args: Any, **kwargs: Any) -> Any:
-        warnings.warn(
-            'The private method `_copy_and_set_values` will be removed and should no longer be used.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import copy_internals
-
-        return copy_internals._copy_and_set_values(self, *args, **kwargs)
-
-    @classmethod
-    @typing_extensions.deprecated(
-        'The private method `_get_value` will be removed and should no longer be used.',
-        category=None,
-    )
-    def _get_value(cls, *args: Any, **kwargs: Any) -> Any:
-        warnings.warn(
-            'The private method `_get_value` will be removed and should no longer be used.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import copy_internals
-
-        return copy_internals._get_value(cls, *args, **kwargs)
-
-    @typing_extensions.deprecated(
-        'The private method `_calculate_keys` will be removed and should no longer be used.',
-        category=None,
-    )
-    def _calculate_keys(self, *args: Any, **kwargs: Any) -> Any:
-        warnings.warn(
-            'The private method `_calculate_keys` will be removed and should no longer be used.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import copy_internals
-
-        return copy_internals._calculate_keys(self, *args, **kwargs)
-
-
-ModelT = TypeVar('ModelT', bound=BaseModel)
-
-
-@overload
-def create_model(
-    model_name: str,
-    /,
-    *,
-    __config__: ConfigDict | None = None,
-    __doc__: str | None = None,
-    __base__: None = None,
-    __module__: str = __name__,
-    __validators__: dict[str, Callable[..., Any]] | None = None,
-    __cls_kwargs__: dict[str, Any] | None = None,
-    **field_definitions: Any | tuple[str, Any],
-) -> type[BaseModel]: ...
-
-
-@overload
-def create_model(
-    model_name: str,
-    /,
-    *,
-    __config__: ConfigDict | None = None,
-    __doc__: str | None = None,
-    __base__: type[ModelT] | tuple[type[ModelT], ...],
-    __module__: str = __name__,
-    __validators__: dict[str, Callable[..., Any]] | None = None,
-    __cls_kwargs__: dict[str, Any] | None = None,
-    **field_definitions: Any | tuple[str, Any],
-) -> type[ModelT]: ...
-
-
-def create_model(  # noqa: C901
-    model_name: str,
-    /,
-    *,
-    __config__: ConfigDict | None = None,
-    __doc__: str | None = None,
-    __base__: type[ModelT] | tuple[type[ModelT], ...] | None = None,
-    __module__: str | None = None,
-    __validators__: dict[str, Callable[..., Any]] | None = None,
-    __cls_kwargs__: dict[str, Any] | None = None,
-    # TODO PEP 747: replace `Any` by the TypeForm:
-    **field_definitions: Any | tuple[str, Any],
-) -> type[ModelT]:
-    """!!! abstract "Usage Documentation"
-        [Dynamic Model Creation](../concepts/models.md#dynamic-model-creation)
-
-    Dynamically creates and returns a new Pydantic model, in other words, `create_model` dynamically creates a
-    subclass of [`BaseModel`][pydantic.BaseModel].
+    All the below attributes can be set via `model_config`.
 
     Args:
-        model_name: The name of the newly created model.
-        __config__: The configuration of the new model.
-        __doc__: The docstring of the new model.
-        __base__: The base class or classes for the new model.
-        __module__: The name of the module that the model belongs to;
-            if `None`, the value is taken from `sys._getframe(1)`
-        __validators__: A dictionary of methods that validate fields. The keys are the names of the validation methods to
-            be added to the model, and the values are the validation methods themselves. You can read more about functional
-            validators [here](https://docs.pydantic.dev/2.9/concepts/validators/#field-validators).
-        __cls_kwargs__: A dictionary of keyword arguments for class creation, such as `metaclass`.
-        **field_definitions: Field definitions of the new model. Either:
-
-            - a single element, representing the type annotation of the field.
-            - a two-tuple, the first element being the type and the second element the assigned value
-              (either a default or the [`Field()`][pydantic.Field] function).
-
-    Returns:
-        The new [model][pydantic.BaseModel].
-
-    Raises:
-        PydanticUserError: If `__base__` and `__config__` are both passed.
+        _case_sensitive: Whether environment and CLI variable names should be read with case-sensitivity.
+            Defaults to `None`.
+        _nested_model_default_partial_update: Whether to allow partial updates on nested model default object fields.
+            Defaults to `False`.
+        _env_prefix: Prefix for all environment variables. Defaults to `None`.
+        _env_file: The env file(s) to load settings values from. Defaults to `Path('')`, which
+            means that the value from `model_config['env_file']` should be used. You can also pass
+            `None` to indicate that environment variables should not be loaded from an env file.
+        _env_file_encoding: The env file encoding, e.g. `'latin-1'`. Defaults to `None`.
+        _env_ignore_empty: Ignore environment variables where the value is an empty string. Default to `False`.
+        _env_nested_delimiter: The nested env values delimiter. Defaults to `None`.
+        _env_nested_max_split: The nested env values maximum nesting. Defaults to `None`, which means no limit.
+        _env_parse_none_str: The env string value that should be parsed (e.g. "null", "void", "None", etc.)
+            into `None` type(None). Defaults to `None` type(None), which means no parsing should occur.
+        _env_parse_enums: Parse enum field names to values. Defaults to `None.`, which means no parsing should occur.
+        _cli_prog_name: The CLI program name to display in help text. Defaults to `None` if _cli_parse_args is `None`.
+            Otherwise, defaults to sys.argv[0].
+        _cli_parse_args: The list of CLI arguments to parse. Defaults to None.
+            If set to `True`, defaults to sys.argv[1:].
+        _cli_settings_source: Override the default CLI settings source with a user defined instance. Defaults to None.
+        _cli_parse_none_str: The CLI string value that should be parsed (e.g. "null", "void", "None", etc.) into
+            `None` type(None). Defaults to _env_parse_none_str value if set. Otherwise, defaults to "null" if
+            _cli_avoid_json is `False`, and "None" if _cli_avoid_json is `True`.
+        _cli_hide_none_type: Hide `None` values in CLI help text. Defaults to `False`.
+        _cli_avoid_json: Avoid complex JSON objects in CLI help text. Defaults to `False`.
+        _cli_enforce_required: Enforce required fields at the CLI. Defaults to `False`.
+        _cli_use_class_docs_for_groups: Use class docstrings in CLI group help text instead of field descriptions.
+            Defaults to `False`.
+        _cli_exit_on_error: Determines whether or not the internal parser exits with error info when an error occurs.
+            Defaults to `True`.
+        _cli_prefix: The root parser command line arguments prefix. Defaults to "".
+        _cli_flag_prefix_char: The flag prefix character to use for CLI optional arguments. Defaults to '-'.
+        _cli_implicit_flags: Whether `bool` fields should be implicitly converted into CLI boolean flags.
+            (e.g. --flag, --no-flag). Defaults to `False`.
+        _cli_ignore_unknown_args: Whether to ignore unknown CLI args and parse only known ones. Defaults to `False`.
+        _cli_kebab_case: CLI args use kebab case. Defaults to `False`.
+        _cli_shortcuts: Mapping of target field name to alias names. Defaults to `None`.
+        _secrets_dir: The secret files directory or a sequence of directories. Defaults to `None`.
     """
-    if __base__ is None:
-        __base__ = (cast('type[ModelT]', BaseModel),)
-    elif not isinstance(__base__, tuple):
-        __base__ = (__base__,)
 
-    __cls_kwargs__ = __cls_kwargs__ or {}
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        **values: Any,
+    ) -> None:
+        super().__init__(
+            **__pydantic_self__._settings_build_values(
+                values,
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+            )
+        )
 
-    fields: dict[str, Any] = {}
-    annotations: dict[str, Any] = {}
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """
+        Define the sources and their order for loading the settings values.
 
-    for f_name, f_def in field_definitions.items():
-        if isinstance(f_def, tuple):
-            if len(f_def) != 2:
-                raise PydanticUserError(
-                    f'Field definition for {f_name!r} should a single element representing the type or a two-tuple, the first element '
-                    'being the type and the second element the assigned value (either a default or the `Field()` function).',
-                    code='create-model-field-definitions',
+        Args:
+            settings_cls: The Settings class.
+            init_settings: The `InitSettingsSource` instance.
+            env_settings: The `EnvSettingsSource` instance.
+            dotenv_settings: The `DotEnvSettingsSource` instance.
+            file_secret_settings: The `SecretsSettingsSource` instance.
+
+        Returns:
+            A tuple containing the sources and their order for loading the settings values.
+        """
+        return init_settings, env_settings, dotenv_settings, file_secret_settings
+
+    def _settings_build_values(
+        self,
+        init_kwargs: dict[str, Any],
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_file: DotenvType | None = None,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+    ) -> dict[str, Any]:
+        # Determine settings config values
+        case_sensitive = _case_sensitive if _case_sensitive is not None else self.model_config.get('case_sensitive')
+        env_prefix = _env_prefix if _env_prefix is not None else self.model_config.get('env_prefix')
+        nested_model_default_partial_update = (
+            _nested_model_default_partial_update
+            if _nested_model_default_partial_update is not None
+            else self.model_config.get('nested_model_default_partial_update')
+        )
+        env_file = _env_file if _env_file != ENV_FILE_SENTINEL else self.model_config.get('env_file')
+        env_file_encoding = (
+            _env_file_encoding if _env_file_encoding is not None else self.model_config.get('env_file_encoding')
+        )
+        env_ignore_empty = (
+            _env_ignore_empty if _env_ignore_empty is not None else self.model_config.get('env_ignore_empty')
+        )
+        env_nested_delimiter = (
+            _env_nested_delimiter
+            if _env_nested_delimiter is not None
+            else self.model_config.get('env_nested_delimiter')
+        )
+        env_nested_max_split = (
+            _env_nested_max_split
+            if _env_nested_max_split is not None
+            else self.model_config.get('env_nested_max_split')
+        )
+        env_parse_none_str = (
+            _env_parse_none_str if _env_parse_none_str is not None else self.model_config.get('env_parse_none_str')
+        )
+        env_parse_enums = _env_parse_enums if _env_parse_enums is not None else self.model_config.get('env_parse_enums')
+
+        cli_prog_name = _cli_prog_name if _cli_prog_name is not None else self.model_config.get('cli_prog_name')
+        cli_parse_args = _cli_parse_args if _cli_parse_args is not None else self.model_config.get('cli_parse_args')
+        cli_settings_source = (
+            _cli_settings_source if _cli_settings_source is not None else self.model_config.get('cli_settings_source')
+        )
+        cli_parse_none_str = (
+            _cli_parse_none_str if _cli_parse_none_str is not None else self.model_config.get('cli_parse_none_str')
+        )
+        cli_parse_none_str = cli_parse_none_str if not env_parse_none_str else env_parse_none_str
+        cli_hide_none_type = (
+            _cli_hide_none_type if _cli_hide_none_type is not None else self.model_config.get('cli_hide_none_type')
+        )
+        cli_avoid_json = _cli_avoid_json if _cli_avoid_json is not None else self.model_config.get('cli_avoid_json')
+        cli_enforce_required = (
+            _cli_enforce_required
+            if _cli_enforce_required is not None
+            else self.model_config.get('cli_enforce_required')
+        )
+        cli_use_class_docs_for_groups = (
+            _cli_use_class_docs_for_groups
+            if _cli_use_class_docs_for_groups is not None
+            else self.model_config.get('cli_use_class_docs_for_groups')
+        )
+        cli_exit_on_error = (
+            _cli_exit_on_error if _cli_exit_on_error is not None else self.model_config.get('cli_exit_on_error')
+        )
+        cli_prefix = _cli_prefix if _cli_prefix is not None else self.model_config.get('cli_prefix')
+        cli_flag_prefix_char = (
+            _cli_flag_prefix_char
+            if _cli_flag_prefix_char is not None
+            else self.model_config.get('cli_flag_prefix_char')
+        )
+        cli_implicit_flags = (
+            _cli_implicit_flags if _cli_implicit_flags is not None else self.model_config.get('cli_implicit_flags')
+        )
+        cli_ignore_unknown_args = (
+            _cli_ignore_unknown_args
+            if _cli_ignore_unknown_args is not None
+            else self.model_config.get('cli_ignore_unknown_args')
+        )
+        cli_kebab_case = _cli_kebab_case if _cli_kebab_case is not None else self.model_config.get('cli_kebab_case')
+        cli_shortcuts = _cli_shortcuts if _cli_shortcuts is not None else self.model_config.get('cli_shortcuts')
+
+        secrets_dir = _secrets_dir if _secrets_dir is not None else self.model_config.get('secrets_dir')
+
+        # Configure built-in sources
+        default_settings = DefaultSettingsSource(
+            self.__class__, nested_model_default_partial_update=nested_model_default_partial_update
+        )
+        init_settings = InitSettingsSource(
+            self.__class__,
+            init_kwargs=init_kwargs,
+            nested_model_default_partial_update=nested_model_default_partial_update,
+        )
+        env_settings = EnvSettingsSource(
+            self.__class__,
+            case_sensitive=case_sensitive,
+            env_prefix=env_prefix,
+            env_nested_delimiter=env_nested_delimiter,
+            env_nested_max_split=env_nested_max_split,
+            env_ignore_empty=env_ignore_empty,
+            env_parse_none_str=env_parse_none_str,
+            env_parse_enums=env_parse_enums,
+        )
+        dotenv_settings = DotEnvSettingsSource(
+            self.__class__,
+            env_file=env_file,
+            env_file_encoding=env_file_encoding,
+            case_sensitive=case_sensitive,
+            env_prefix=env_prefix,
+            env_nested_delimiter=env_nested_delimiter,
+            env_nested_max_split=env_nested_max_split,
+            env_ignore_empty=env_ignore_empty,
+            env_parse_none_str=env_parse_none_str,
+            env_parse_enums=env_parse_enums,
+        )
+
+        file_secret_settings = SecretsSettingsSource(
+            self.__class__, secrets_dir=secrets_dir, case_sensitive=case_sensitive, env_prefix=env_prefix
+        )
+        # Provide a hook to set built-in sources priority and add / remove sources
+        sources = self.settings_customise_sources(
+            self.__class__,
+            init_settings=init_settings,
+            env_settings=env_settings,
+            dotenv_settings=dotenv_settings,
+            file_secret_settings=file_secret_settings,
+        ) + (default_settings,)
+        if not any([source for source in sources if isinstance(source, CliSettingsSource)]):
+            if isinstance(cli_settings_source, CliSettingsSource):
+                sources = (cli_settings_source,) + sources
+            elif cli_parse_args is not None:
+                cli_settings = CliSettingsSource[Any](
+                    self.__class__,
+                    cli_prog_name=cli_prog_name,
+                    cli_parse_args=cli_parse_args,
+                    cli_parse_none_str=cli_parse_none_str,
+                    cli_hide_none_type=cli_hide_none_type,
+                    cli_avoid_json=cli_avoid_json,
+                    cli_enforce_required=cli_enforce_required,
+                    cli_use_class_docs_for_groups=cli_use_class_docs_for_groups,
+                    cli_exit_on_error=cli_exit_on_error,
+                    cli_prefix=cli_prefix,
+                    cli_flag_prefix_char=cli_flag_prefix_char,
+                    cli_implicit_flags=cli_implicit_flags,
+                    cli_ignore_unknown_args=cli_ignore_unknown_args,
+                    cli_kebab_case=cli_kebab_case,
+                    cli_shortcuts=cli_shortcuts,
+                    case_sensitive=case_sensitive,
                 )
+                sources = (cli_settings,) + sources
+        if sources:
+            state: dict[str, Any] = {}
+            states: dict[str, dict[str, Any]] = {}
+            for source in sources:
+                if isinstance(source, PydanticBaseSettingsSource):
+                    source._set_current_state(state)
+                    source._set_settings_sources_data(states)
 
-            annotations[f_name] = f_def[0]
-            fields[f_name] = f_def[1]
+                source_name = source.__name__ if hasattr(source, '__name__') else type(source).__name__
+                source_state = source()
+
+                states[source_name] = source_state
+                state = deep_update(source_state, state)
+            return state
         else:
-            annotations[f_name] = f_def
+            # no one should mean to do this, but I think returning an empty dict is marginally preferable
+            # to an informative error and much better than a confusing error
+            return {}
 
-    if __module__ is None:
-        f = sys._getframe(1)
-        __module__ = f.f_globals['__name__']
-
-    namespace: dict[str, Any] = {'__annotations__': annotations, '__module__': __module__}
-    if __doc__:
-        namespace.update({'__doc__': __doc__})
-    if __validators__:
-        namespace.update(__validators__)
-    namespace.update(fields)
-    if __config__:
-        namespace['model_config'] = __config__
-    resolved_bases = types.resolve_bases(__base__)
-    meta, ns, kwds = types.prepare_class(model_name, resolved_bases, kwds=__cls_kwargs__)
-    if resolved_bases is not __base__:
-        ns['__orig_bases__'] = __base__
-    namespace.update(ns)
-
-    return meta(
-        model_name,
-        resolved_bases,
-        namespace,
-        __pydantic_reset_parent_namespace__=False,
-        _create_model_module=__module__,
-        **kwds,
+    model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(
+        extra='forbid',
+        arbitrary_types_allowed=True,
+        validate_default=True,
+        case_sensitive=False,
+        env_prefix='',
+        nested_model_default_partial_update=False,
+        env_file=None,
+        env_file_encoding=None,
+        env_ignore_empty=False,
+        env_nested_delimiter=None,
+        env_nested_max_split=None,
+        env_parse_none_str=None,
+        env_parse_enums=None,
+        cli_prog_name=None,
+        cli_parse_args=None,
+        cli_parse_none_str=None,
+        cli_hide_none_type=False,
+        cli_avoid_json=False,
+        cli_enforce_required=False,
+        cli_use_class_docs_for_groups=False,
+        cli_exit_on_error=True,
+        cli_prefix='',
+        cli_flag_prefix_char='-',
+        cli_implicit_flags=False,
+        cli_ignore_unknown_args=False,
+        cli_kebab_case=False,
+        cli_shortcuts=None,
+        json_file=None,
+        json_file_encoding=None,
+        yaml_file=None,
+        yaml_file_encoding=None,
+        yaml_config_section=None,
+        toml_file=None,
+        secrets_dir=None,
+        protected_namespaces=('model_validate', 'model_dump', 'settings_customise_sources'),
+        enable_decoding=True,
     )
 
 
-__getattr__ = getattr_migration(__name__)
+class CliApp:
+    """
+    A utility class for running Pydantic `BaseSettings`, `BaseModel`, or `pydantic.dataclasses.dataclass` as
+    CLI applications.
+    """
+
+    @staticmethod
+    def _run_cli_cmd(model: Any, cli_cmd_method_name: str, is_required: bool) -> Any:
+        command = getattr(type(model), cli_cmd_method_name, None)
+        if command is None:
+            if is_required:
+                raise SettingsError(f'Error: {type(model).__name__} class is missing {cli_cmd_method_name} entrypoint')
+            return model
+
+        # If the method is asynchronous, we handle its execution based on the current event loop status.
+        if inspect.iscoroutinefunction(command):
+            # For asynchronous methods, we have two execution scenarios:
+            # 1. If no event loop is running in the current thread, run the coroutine directly with asyncio.run().
+            # 2. If an event loop is already running in the current thread, run the coroutine in a separate thread to avoid conflicts.
+            try:
+                # Check if an event loop is currently running in this thread.
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                # We're in a context with an active event loop (e.g., Jupyter Notebook).
+                # Running asyncio.run() here would cause conflicts, so we use a separate thread.
+                exception_container = []
+
+                def run_coro() -> None:
+                    try:
+                        # Execute the coroutine in a new event loop in this separate thread.
+                        asyncio.run(command(model))
+                    except Exception as e:
+                        exception_container.append(e)
+
+                thread = threading.Thread(target=run_coro)
+                thread.start()
+                thread.join()
+                if exception_container:
+                    # Propagate exceptions from the separate thread.
+                    raise exception_container[0]
+            else:
+                # No event loop is running; safe to run the coroutine directly.
+                asyncio.run(command(model))
+        else:
+            # For synchronous methods, call them directly.
+            command(model)
+
+        return model
+
+    @staticmethod
+    def run(
+        model_cls: type[T],
+        cli_args: list[str] | Namespace | SimpleNamespace | dict[str, Any] | None = None,
+        cli_settings_source: CliSettingsSource[Any] | None = None,
+        cli_exit_on_error: bool | None = None,
+        cli_cmd_method_name: str = 'cli_cmd',
+        **model_init_data: Any,
+    ) -> T:
+        """
+        Runs a Pydantic `BaseSettings`, `BaseModel`, or `pydantic.dataclasses.dataclass` as a CLI application.
+        Running a model as a CLI application requires the `cli_cmd` method to be defined in the model class.
+
+        Args:
+            model_cls: The model class to run as a CLI application.
+            cli_args: The list of CLI arguments to parse. If `cli_settings_source` is specified, this may
+                also be a namespace or dictionary of pre-parsed CLI arguments. Defaults to `sys.argv[1:]`.
+            cli_settings_source: Override the default CLI settings source with a user defined instance.
+                Defaults to `None`.
+            cli_exit_on_error: Determines whether this function exits on error. If model is subclass of
+                `BaseSettings`, defaults to BaseSettings `cli_exit_on_error` value. Otherwise, defaults to
+                `True`.
+            cli_cmd_method_name: The CLI command method name to run. Defaults to "cli_cmd".
+            model_init_data: The model init data.
+
+        Returns:
+            The ran instance of model.
+
+        Raises:
+            SettingsError: If model_cls is not subclass of `BaseModel` or `pydantic.dataclasses.dataclass`.
+            SettingsError: If model_cls does not have a `cli_cmd` entrypoint defined.
+        """
+
+        if not (is_pydantic_dataclass(model_cls) or is_model_class(model_cls)):
+            raise SettingsError(
+                f'Error: {model_cls.__name__} is not subclass of BaseModel or pydantic.dataclasses.dataclass'
+            )
+
+        cli_settings = None
+        cli_parse_args = True if cli_args is None else cli_args
+        if cli_settings_source is not None:
+            if isinstance(cli_parse_args, (Namespace, SimpleNamespace, dict)):
+                cli_settings = cli_settings_source(parsed_args=cli_parse_args)
+            else:
+                cli_settings = cli_settings_source(args=cli_parse_args)
+        elif isinstance(cli_parse_args, (Namespace, SimpleNamespace, dict)):
+            raise SettingsError('Error: `cli_args` must be list[str] or None when `cli_settings_source` is not used')
+
+        model_init_data['_cli_parse_args'] = cli_parse_args
+        model_init_data['_cli_exit_on_error'] = cli_exit_on_error
+        model_init_data['_cli_settings_source'] = cli_settings
+        if not issubclass(model_cls, BaseSettings):
+
+            class CliAppBaseSettings(BaseSettings, model_cls):  # type: ignore
+                __doc__ = model_cls.__doc__
+                model_config = SettingsConfigDict(
+                    nested_model_default_partial_update=True,
+                    case_sensitive=True,
+                    cli_hide_none_type=True,
+                    cli_avoid_json=True,
+                    cli_enforce_required=True,
+                    cli_implicit_flags=True,
+                    cli_kebab_case=True,
+                )
+
+            model = CliAppBaseSettings(**model_init_data)
+            model_init_data = {}
+            for field_name, field_info in type(model).model_fields.items():
+                model_init_data[_field_name_for_signature(field_name, field_info)] = getattr(model, field_name)
+
+        return CliApp._run_cli_cmd(model_cls(**model_init_data), cli_cmd_method_name, is_required=False)
+
+    @staticmethod
+    def run_subcommand(
+        model: PydanticModel, cli_exit_on_error: bool | None = None, cli_cmd_method_name: str = 'cli_cmd'
+    ) -> PydanticModel:
+        """
+        Runs the model subcommand. Running a model subcommand requires the `cli_cmd` method to be defined in
+        the nested model subcommand class.
+
+        Args:
+            model: The model to run the subcommand from.
+            cli_exit_on_error: Determines whether this function exits with error if no subcommand is found.
+                Defaults to model_config `cli_exit_on_error` value if set. Otherwise, defaults to `True`.
+            cli_cmd_method_name: The CLI command method name to run. Defaults to "cli_cmd".
+
+        Returns:
+            The ran subcommand model.
+
+        Raises:
+            SystemExit: When no subcommand is found and cli_exit_on_error=`True` (the default).
+            SettingsError: When no subcommand is found and cli_exit_on_error=`False`.
+        """
+
+        subcommand = get_subcommand(model, is_required=True, cli_exit_on_error=cli_exit_on_error)
+        return CliApp._run_cli_cmd(subcommand, cli_cmd_method_name, is_required=True)

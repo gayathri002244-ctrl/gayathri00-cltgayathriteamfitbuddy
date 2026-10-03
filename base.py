@@ -1,699 +1,521 @@
-#
-# This file is part of pyasn1 software.
-#
-# Copyright (c) 2005-2020, Ilya Etingof <etingof@gmail.com>
-# License: https://pyasn1.readthedocs.io/en/latest/license.html
-#
-import sys
+"""Base classes and core functionality for pydantic-settings sources."""
 
-from pyasn1 import error
-from pyasn1.type import constraint
-from pyasn1.type import tag
-from pyasn1.type import tagmap
+from __future__ import annotations as _annotations
 
-__all__ = ['Asn1Item', 'Asn1Type', 'SimpleAsn1Type',
-           'ConstructedAsn1Type']
+import json
+import os
+from abc import ABC, abstractmethod
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional, cast
+
+from pydantic import AliasChoices, AliasPath, BaseModel, TypeAdapter
+from pydantic._internal._typing_extra import (  # type: ignore[attr-defined]
+    get_origin,
+)
+from pydantic._internal._utils import is_model_class
+from pydantic.fields import FieldInfo
+from typing_extensions import get_args
+from typing_inspection.introspection import is_union_origin
+
+from ..exceptions import SettingsError
+from ..utils import _lenient_issubclass
+from .types import EnvNoneType, ForceDecode, NoDecode, PathType, PydanticModel, _CliSubCommand
+from .utils import (
+    _annotation_is_complex,
+    _get_alias_names,
+    _get_model_fields,
+    _union_is_complex,
+)
+
+if TYPE_CHECKING:
+    from pydantic_settings.main import BaseSettings
 
 
-class Asn1Item(object):
-    @classmethod
-    def getTypeId(cls, increment=1):
-        try:
-            Asn1Item._typeCounter += increment
-        except AttributeError:
-            Asn1Item._typeCounter = increment
-        return Asn1Item._typeCounter
-
-
-class Asn1Type(Asn1Item):
-    """Base class for all classes representing ASN.1 types.
-
-    In the user code, |ASN.1| class is normally used only for telling
-    ASN.1 objects from others.
-
-    Note
-    ----
-    For as long as ASN.1 is concerned, a way to compare ASN.1 types
-    is to use :meth:`isSameTypeWith` and :meth:`isSuperTypeOf` methods.
+def get_subcommand(
+    model: PydanticModel, is_required: bool = True, cli_exit_on_error: bool | None = None
+) -> Optional[PydanticModel]:
     """
-    #: Set or return a :py:class:`~pyasn1.type.tag.TagSet` object representing
-    #: ASN.1 tag(s) associated with |ASN.1| type.
-    tagSet = tag.TagSet()
+    Get the subcommand from a model.
 
-    #: Default :py:class:`~pyasn1.type.constraint.ConstraintsIntersection`
-    #: object imposing constraints on initialization values.
-    subtypeSpec = constraint.ConstraintsIntersection()
+    Args:
+        model: The model to get the subcommand from.
+        is_required: Determines whether a model must have subcommand set and raises error if not
+            found. Defaults to `True`.
+        cli_exit_on_error: Determines whether this function exits with error if no subcommand is found.
+            Defaults to model_config `cli_exit_on_error` value if set. Otherwise, defaults to `True`.
 
-    # Disambiguation ASN.1 types identification
-    typeId = None
+    Returns:
+        The subcommand model if found, otherwise `None`.
 
-    def __init__(self, **kwargs):
-        readOnly = {
-            'tagSet': self.tagSet,
-            'subtypeSpec': self.subtypeSpec
-        }
-
-        readOnly.update(kwargs)
-
-        self.__dict__.update(readOnly)
-
-        self._readOnly = readOnly
-
-    def __setattr__(self, name, value):
-        if name[0] != '_' and name in self._readOnly:
-            raise error.PyAsn1Error('read-only instance attribute "%s"' % name)
-
-        self.__dict__[name] = value
-
-    def __str__(self):
-        return self.prettyPrint()
-
-    @property
-    def readOnly(self):
-        return self._readOnly
-
-    @property
-    def effectiveTagSet(self):
-        """For |ASN.1| type is equivalent to *tagSet*
-        """
-        return self.tagSet  # used by untagged types
-
-    @property
-    def tagMap(self):
-        """Return a :class:`~pyasn1.type.tagmap.TagMap` object mapping ASN.1 tags to ASN.1 objects within callee object.
-        """
-        return tagmap.TagMap({self.tagSet: self})
-
-    def isSameTypeWith(self, other, matchTags=True, matchConstraints=True):
-        """Examine |ASN.1| type for equality with other ASN.1 type.
-
-        ASN.1 tags (:py:mod:`~pyasn1.type.tag`) and constraints
-        (:py:mod:`~pyasn1.type.constraint`) are examined when carrying
-        out ASN.1 types comparison.
-
-        Python class inheritance relationship is NOT considered.
-
-        Parameters
-        ----------
-        other: a pyasn1 type object
-            Class instance representing ASN.1 type.
-
-        Returns
-        -------
-        : :class:`bool`
-            :obj:`True` if *other* is |ASN.1| type,
-            :obj:`False` otherwise.
-        """
-        return (self is other or
-                (not matchTags or self.tagSet == other.tagSet) and
-                (not matchConstraints or self.subtypeSpec == other.subtypeSpec))
-
-    def isSuperTypeOf(self, other, matchTags=True, matchConstraints=True):
-        """Examine |ASN.1| type for subtype relationship with other ASN.1 type.
-
-        ASN.1 tags (:py:mod:`~pyasn1.type.tag`) and constraints
-        (:py:mod:`~pyasn1.type.constraint`) are examined when carrying
-        out ASN.1 types comparison.
-
-        Python class inheritance relationship is NOT considered.
-
-        Parameters
-        ----------
-            other: a pyasn1 type object
-                Class instance representing ASN.1 type.
-
-        Returns
-        -------
-            : :class:`bool`
-                :obj:`True` if *other* is a subtype of |ASN.1| type,
-                :obj:`False` otherwise.
-        """
-        return (not matchTags or
-                (self.tagSet.isSuperTagSetOf(other.tagSet)) and
-                 (not matchConstraints or self.subtypeSpec.isSuperTypeOf(other.subtypeSpec)))
-
-    @staticmethod
-    def isNoValue(*values):
-        for value in values:
-            if value is not noValue:
-                return False
-        return True
-
-    def prettyPrint(self, scope=0):
-        raise NotImplementedError
-
-    # backward compatibility
-
-    def getTagSet(self):
-        return self.tagSet
-
-    def getEffectiveTagSet(self):
-        return self.effectiveTagSet
-
-    def getTagMap(self):
-        return self.tagMap
-
-    def getSubtypeSpec(self):
-        return self.subtypeSpec
-
-    # backward compatibility
-    def hasValue(self):
-        return self.isValue
-
-# Backward compatibility
-Asn1ItemBase = Asn1Type
-
-
-class NoValue(object):
-    """Create a singleton instance of NoValue class.
-
-    The *NoValue* sentinel object represents an instance of ASN.1 schema
-    object as opposed to ASN.1 value object.
-
-    Only ASN.1 schema-related operations can be performed on ASN.1
-    schema objects.
-
-    Warning
-    -------
-    Any operation attempted on the *noValue* object will raise the
-    *PyAsn1Error* exception.
+    Raises:
+        SystemExit: When no subcommand is found and is_required=`True` and cli_exit_on_error=`True`
+            (the default).
+        SettingsError: When no subcommand is found and is_required=`True` and
+            cli_exit_on_error=`False`.
     """
-    skipMethods = {
-        '__slots__',
-        # attributes
-        '__getattribute__',
-        '__getattr__',
-        '__setattr__',
-        '__delattr__',
-        # class instance
-        '__class__',
-        '__init__',
-        '__del__',
-        '__new__',
-        '__repr__',
-        '__qualname__',
-        '__objclass__',
-        'im_class',
-        '__sizeof__',
-        # pickle protocol
-        '__reduce__',
-        '__reduce_ex__',
-        '__getnewargs__',
-        '__getinitargs__',
-        '__getstate__',
-        '__setstate__',
-    }
 
-    _instance = None
+    model_cls = type(model)
+    if cli_exit_on_error is None and is_model_class(model_cls):
+        model_default = model_cls.model_config.get('cli_exit_on_error')
+        if isinstance(model_default, bool):
+            cli_exit_on_error = model_default
+    if cli_exit_on_error is None:
+        cli_exit_on_error = True
 
-    def __new__(cls):
-        if cls._instance is None:
-            def getPlug(name):
-                def plug(self, *args, **kw):
-                    raise error.PyAsn1Error('Attempted "%s" operation on ASN.1 schema object' % name)
-                return plug
+    subcommands: list[str] = []
+    for field_name, field_info in _get_model_fields(model_cls).items():
+        if _CliSubCommand in field_info.metadata:
+            if getattr(model, field_name) is not None:
+                return getattr(model, field_name)
+            subcommands.append(field_name)
 
-            op_names = [name
-                        for typ in (str, int, list, dict)
-                        for name in dir(typ)
-                        if (name not in cls.skipMethods and
-                            name.startswith('__') and
-                            name.endswith('__') and
-                            callable(getattr(typ, name)))]
+    if is_required:
+        error_message = (
+            f'Error: CLI subcommand is required {{{", ".join(subcommands)}}}'
+            if subcommands
+            else 'Error: CLI subcommand is required but no subcommands were found.'
+        )
+        raise SystemExit(error_message) if cli_exit_on_error else SettingsError(error_message)
 
-            for name in set(op_names):
-                setattr(cls, name, getPlug(name))
-
-            cls._instance = object.__new__(cls)
-
-        return cls._instance
-
-    def __getattr__(self, attr):
-        if attr in self.skipMethods:
-            raise AttributeError('Attribute %s not present' % attr)
-
-        raise error.PyAsn1Error('Attempted "%s" operation on ASN.1 schema object' % attr)
-
-    def __repr__(self):
-        return '<%s object>' % self.__class__.__name__
+    return None
 
 
-noValue = NoValue()
-
-
-class SimpleAsn1Type(Asn1Type):
-    """Base class for all simple classes representing ASN.1 types.
-
-    ASN.1 distinguishes types by their ability to hold other objects.
-    Scalar types are known as *simple* in ASN.1.
-
-    In the user code, |ASN.1| class is normally used only for telling
-    ASN.1 objects from others.
-
-    Note
-    ----
-    For as long as ASN.1 is concerned, a way to compare ASN.1 types
-    is to use :meth:`isSameTypeWith` and :meth:`isSuperTypeOf` methods.
+class PydanticBaseSettingsSource(ABC):
     """
-    #: Default payload value
-    defaultValue = noValue
+    Abstract base class for settings sources, every settings source classes should inherit from it.
+    """
 
-    def __init__(self, value=noValue, **kwargs):
-        Asn1Type.__init__(self, **kwargs)
-        if value is noValue:
-            value = self.defaultValue
-        else:
-            value = self.prettyIn(value)
-            try:
-                self.subtypeSpec(value)
+    def __init__(self, settings_cls: type[BaseSettings]):
+        self.settings_cls = settings_cls
+        self.config = settings_cls.model_config
+        self._current_state: dict[str, Any] = {}
+        self._settings_sources_data: dict[str, dict[str, Any]] = {}
 
-            except error.PyAsn1Error as exValue:
-                raise type(exValue)('%s at %s' % (exValue, self.__class__.__name__))
+    def _set_current_state(self, state: dict[str, Any]) -> None:
+        """
+        Record the state of settings from the previous settings sources. This should
+        be called right before __call__.
+        """
+        self._current_state = state
 
-        self._value = value
-
-    def __repr__(self):
-        representation = '%s %s object' % (
-            self.__class__.__name__, self.isValue and 'value' or 'schema')
-
-        for attr, value in self.readOnly.items():
-            if value:
-                representation += ', %s %s' % (attr, value)
-
-        if self.isValue:
-            value = self.prettyPrint()
-            if len(value) > 32:
-                value = value[:16] + '...' + value[-16:]
-            representation += ', payload [%s]' % value
-
-        return '<%s>' % representation
-
-    def __eq__(self, other):
-        if self is other:
-            return True
-        return self._value == other
-
-    def __ne__(self, other):
-        return self._value != other
-
-    def __lt__(self, other):
-        return self._value < other
-
-    def __le__(self, other):
-        return self._value <= other
-
-    def __gt__(self, other):
-        return self._value > other
-
-    def __ge__(self, other):
-        return self._value >= other
-
-    def __bool__(self):
-        return bool(self._value)
-
-    def __hash__(self):
-        return hash(self._value)
+    def _set_settings_sources_data(self, states: dict[str, dict[str, Any]]) -> None:
+        """
+        Record the state of settings from all previous settings sources. This should
+        be called right before __call__.
+        """
+        self._settings_sources_data = states
 
     @property
-    def isValue(self):
-        """Indicate that |ASN.1| object represents ASN.1 value.
-
-        If *isValue* is :obj:`False` then this object represents just
-        ASN.1 schema.
-
-        If *isValue* is :obj:`True` then, in addition to its ASN.1 schema
-        features, this object can also be used like a Python built-in object
-        (e.g. :class:`int`, :class:`str`, :class:`dict` etc.).
-
-        Returns
-        -------
-        : :class:`bool`
-            :obj:`False` if object represents just ASN.1 schema.
-            :obj:`True` if object represents ASN.1 schema and can be used as a normal value.
-
-        Note
-        ----
-        There is an important distinction between PyASN1 schema and value objects.
-        The PyASN1 schema objects can only participate in ASN.1 schema-related
-        operations (e.g. defining or testing the structure of the data). Most
-        obvious uses of ASN.1 schema is to guide serialisation codecs whilst
-        encoding/decoding serialised ASN.1 contents.
-
-        The PyASN1 value objects can **additionally** participate in many operations
-        involving regular Python objects (e.g. arithmetic, comprehension etc).
+    def current_state(self) -> dict[str, Any]:
         """
-        return self._value is not noValue
-
-    def clone(self, value=noValue, **kwargs):
-        """Create a modified version of |ASN.1| schema or value object.
-
-        The `clone()` method accepts the same set arguments as |ASN.1|
-        class takes on instantiation except that all arguments
-        of the `clone()` method are optional.
-
-        Whatever arguments are supplied, they are used to create a copy
-        of `self` taking precedence over the ones used to instantiate `self`.
-
-        Note
-        ----
-        Due to the immutable nature of the |ASN.1| object, if no arguments
-        are supplied, no new |ASN.1| object will be created and `self` will
-        be returned instead.
+        The current state of the settings, populated by the previous settings sources.
         """
-        if value is noValue:
-            if not kwargs:
-                return self
+        return self._current_state
 
-            value = self._value
-
-        initializers = self.readOnly.copy()
-        initializers.update(kwargs)
-
-        return self.__class__(value, **initializers)
-
-    def subtype(self, value=noValue, **kwargs):
-        """Create a specialization of |ASN.1| schema or value object.
-
-        The subtype relationship between ASN.1 types has no correlation with
-        subtype relationship between Python types. ASN.1 type is mainly identified
-        by its tag(s) (:py:class:`~pyasn1.type.tag.TagSet`) and value range
-        constraints (:py:class:`~pyasn1.type.constraint.ConstraintsIntersection`).
-        These ASN.1 type properties are implemented as |ASN.1| attributes.  
-
-        The `subtype()` method accepts the same set arguments as |ASN.1|
-        class takes on instantiation except that all parameters
-        of the `subtype()` method are optional.
-
-        With the exception of the arguments described below, the rest of
-        supplied arguments they are used to create a copy of `self` taking
-        precedence over the ones used to instantiate `self`.
-
-        The following arguments to `subtype()` create a ASN.1 subtype out of
-        |ASN.1| type:
-
-        Other Parameters
-        ----------------
-        implicitTag: :py:class:`~pyasn1.type.tag.Tag`
-            Implicitly apply given ASN.1 tag object to `self`'s
-            :py:class:`~pyasn1.type.tag.TagSet`, then use the result as
-            new object's ASN.1 tag(s).
-
-        explicitTag: :py:class:`~pyasn1.type.tag.Tag`
-            Explicitly apply given ASN.1 tag object to `self`'s
-            :py:class:`~pyasn1.type.tag.TagSet`, then use the result as
-            new object's ASN.1 tag(s).
-
-        subtypeSpec: :py:class:`~pyasn1.type.constraint.ConstraintsIntersection`
-            Add ASN.1 constraints object to one of the `self`'s, then
-            use the result as new object's ASN.1 constraints.
-
-        Returns
-        -------
-        :
-            new instance of |ASN.1| schema or value object
-
-        Note
-        ----
-        Due to the immutable nature of the |ASN.1| object, if no arguments
-        are supplied, no new |ASN.1| object will be created and `self` will
-        be returned instead.
+    @property
+    def settings_sources_data(self) -> dict[str, dict[str, Any]]:
         """
-        if value is noValue:
-            if not kwargs:
-                return self
+        The state of all previous settings sources.
+        """
+        return self._settings_sources_data
 
-            value = self._value
+    @abstractmethod
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        """
+        Gets the value, the key for model creation, and a flag to determine whether value is complex.
 
-        initializers = self.readOnly.copy()
+        This is an abstract method that should be overridden in every settings source classes.
 
-        implicitTag = kwargs.pop('implicitTag', None)
-        if implicitTag is not None:
-            initializers['tagSet'] = self.tagSet.tagImplicitly(implicitTag)
+        Args:
+            field: The field.
+            field_name: The field name.
 
-        explicitTag = kwargs.pop('explicitTag', None)
-        if explicitTag is not None:
-            initializers['tagSet'] = self.tagSet.tagExplicitly(explicitTag)
+        Returns:
+            A tuple that contains the value, key and a flag to determine whether value is complex.
+        """
+        pass
 
-        for arg, option in kwargs.items():
-            initializers[arg] += option
+    def field_is_complex(self, field: FieldInfo) -> bool:
+        """
+        Checks whether a field is complex, in which case it will attempt to be parsed as JSON.
 
-        return self.__class__(value, **initializers)
+        Args:
+            field: The field.
 
-    def prettyIn(self, value):
+        Returns:
+            Whether the field is complex.
+        """
+        return _annotation_is_complex(field.annotation, field.metadata)
+
+    def prepare_field_value(self, field_name: str, field: FieldInfo, value: Any, value_is_complex: bool) -> Any:
+        """
+        Prepares the value of a field.
+
+        Args:
+            field_name: The field name.
+            field: The field.
+            value: The value of the field that has to be prepared.
+            value_is_complex: A flag to determine whether value is complex.
+
+        Returns:
+            The prepared value.
+        """
+        if value is not None and (self.field_is_complex(field) or value_is_complex):
+            return self.decode_complex_value(field_name, field, value)
         return value
 
-    def prettyOut(self, value):
-        return str(value)
+    def decode_complex_value(self, field_name: str, field: FieldInfo, value: Any) -> Any:
+        """
+        Decode the value for a complex field
 
-    def prettyPrint(self, scope=0):
-        return self.prettyOut(self._value)
+        Args:
+            field_name: The field name.
+            field: The field.
+            value: The value of the field that has to be prepared.
 
-    def prettyPrintType(self, scope=0):
-        return '%s -> %s' % (self.tagSet, self.__class__.__name__)
+        Returns:
+            The decoded value for further preparation
+        """
+        if field and (
+            NoDecode in field.metadata
+            or (self.config.get('enable_decoding') is False and ForceDecode not in field.metadata)
+        ):
+            return value
 
-# Backward compatibility
-AbstractSimpleAsn1Item = SimpleAsn1Type
+        return json.loads(value)
 
-#
-# Constructed types:
-# * There are five of them: Sequence, SequenceOf/SetOf, Set and Choice
-# * ASN1 types and values are represened by Python class instances
-# * Value initialization is made for defaulted components only
-# * Primary method of component addressing is by-position. Data model for base
-#   type is Python sequence. Additional type-specific addressing methods
-#   may be implemented for particular types.
-# * SequenceOf and SetOf types do not implement any additional methods
-# * Sequence, Set and Choice types also implement by-identifier addressing
-# * Sequence, Set and Choice types also implement by-asn1-type (tag) addressing
-# * Sequence and Set types may include optional and defaulted
-#   components
-# * Constructed types hold a reference to component types used for value
-#   verification and ordering.
-# * Component type is a scalar type for SequenceOf/SetOf types and a list
-#   of types for Sequence/Set/Choice.
-#
+    @abstractmethod
+    def __call__(self) -> dict[str, Any]:
+        pass
 
 
-class ConstructedAsn1Type(Asn1Type):
-    """Base class for all constructed classes representing ASN.1 types.
+class ConfigFileSourceMixin(ABC):
+    def _read_files(self, files: PathType | None) -> dict[str, Any]:
+        if files is None:
+            return {}
+        if isinstance(files, (str, os.PathLike)):
+            files = [files]
+        vars: dict[str, Any] = {}
+        for file in files:
+            file_path = Path(file).expanduser()
+            if file_path.is_file():
+                vars.update(self._read_file(file_path))
+        return vars
 
-    ASN.1 distinguishes types by their ability to hold other objects.
-    Those "nesting" types are known as *constructed* in ASN.1.
+    @abstractmethod
+    def _read_file(self, path: Path) -> dict[str, Any]:
+        pass
 
-    In the user code, |ASN.1| class is normally used only for telling
-    ASN.1 objects from others.
 
-    Note
-    ----
-    For as long as ASN.1 is concerned, a way to compare ASN.1 types
-    is to use :meth:`isSameTypeWith` and :meth:`isSuperTypeOf` methods.
+class DefaultSettingsSource(PydanticBaseSettingsSource):
+    """
+    Source class for loading default object values.
+
+    Args:
+        settings_cls: The Settings class.
+        nested_model_default_partial_update: Whether to allow partial updates on nested model default object fields.
+            Defaults to `False`.
     """
 
-    #: If :obj:`True`, requires exact component type matching,
-    #: otherwise subtype relation is only enforced
-    strictConstraints = False
+    def __init__(self, settings_cls: type[BaseSettings], nested_model_default_partial_update: bool | None = None):
+        super().__init__(settings_cls)
+        self.defaults: dict[str, Any] = {}
+        self.nested_model_default_partial_update = (
+            nested_model_default_partial_update
+            if nested_model_default_partial_update is not None
+            else self.config.get('nested_model_default_partial_update', False)
+        )
+        if self.nested_model_default_partial_update:
+            for field_name, field_info in settings_cls.model_fields.items():
+                alias_names, *_ = _get_alias_names(field_name, field_info)
+                preferred_alias = alias_names[0]
+                if is_dataclass(type(field_info.default)):
+                    self.defaults[preferred_alias] = asdict(field_info.default)
+                elif is_model_class(type(field_info.default)):
+                    self.defaults[preferred_alias] = field_info.default.model_dump()
 
-    componentType = None
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        # Nothing to do here. Only implement the return statement to make mypy happy
+        return None, '', False
 
-    # backward compatibility, unused
-    sizeSpec = constraint.ConstraintsIntersection()
+    def __call__(self) -> dict[str, Any]:
+        return self.defaults
 
-    def __init__(self, **kwargs):
-        readOnly = {
-            'componentType': self.componentType,
-            # backward compatibility, unused
-            'sizeSpec': self.sizeSpec
-        }
-
-        # backward compatibility: preserve legacy sizeSpec support
-        kwargs = self._moveSizeSpec(**kwargs)
-
-        readOnly.update(kwargs)
-
-        Asn1Type.__init__(self, **readOnly)
-
-    def _moveSizeSpec(self, **kwargs):
-        # backward compatibility, unused
-        sizeSpec = kwargs.pop('sizeSpec', self.sizeSpec)
-        if sizeSpec:
-            subtypeSpec = kwargs.pop('subtypeSpec', self.subtypeSpec)
-            if subtypeSpec:
-                subtypeSpec = sizeSpec
-
-            else:
-                subtypeSpec += sizeSpec
-
-            kwargs['subtypeSpec'] = subtypeSpec
-
-        return kwargs
-
-    def __repr__(self):
-        representation = '%s %s object' % (
-            self.__class__.__name__, self.isValue and 'value' or 'schema'
+    def __repr__(self) -> str:
+        return (
+            f'{self.__class__.__name__}(nested_model_default_partial_update={self.nested_model_default_partial_update})'
         )
 
-        for attr, value in self.readOnly.items():
-            if value is not noValue:
-                representation += ', %s=%r' % (attr, value)
 
-        if self.isValue and self.components:
-            representation += ', payload [%s]' % ', '.join(
-                [repr(x) for x in self.components])
+class InitSettingsSource(PydanticBaseSettingsSource):
+    """
+    Source class for loading values provided during settings class initialization.
+    """
 
-        return '<%s>' % representation
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        init_kwargs: dict[str, Any],
+        nested_model_default_partial_update: bool | None = None,
+    ):
+        self.init_kwargs = {}
+        init_kwarg_names = set(init_kwargs.keys())
+        for field_name, field_info in settings_cls.model_fields.items():
+            alias_names, *_ = _get_alias_names(field_name, field_info)
+            init_kwarg_name = init_kwarg_names & set(alias_names)
+            if init_kwarg_name:
+                preferred_alias = alias_names[0]
+                init_kwarg_names -= init_kwarg_name
+                self.init_kwargs[preferred_alias] = init_kwargs[init_kwarg_name.pop()]
+        self.init_kwargs.update({key: val for key, val in init_kwargs.items() if key in init_kwarg_names})
 
-    def __eq__(self, other):
-        return self is other or self.components == other
+        super().__init__(settings_cls)
+        self.nested_model_default_partial_update = (
+            nested_model_default_partial_update
+            if nested_model_default_partial_update is not None
+            else self.config.get('nested_model_default_partial_update', False)
+        )
 
-    def __ne__(self, other):
-        return self.components != other
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        # Nothing to do here. Only implement the return statement to make mypy happy
+        return None, '', False
 
-    def __lt__(self, other):
-        return self.components < other
+    def __call__(self) -> dict[str, Any]:
+        return (
+            TypeAdapter(dict[str, Any]).dump_python(self.init_kwargs)
+            if self.nested_model_default_partial_update
+            else self.init_kwargs
+        )
 
-    def __le__(self, other):
-        return self.components <= other
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(init_kwargs={self.init_kwargs!r})'
 
-    def __gt__(self, other):
-        return self.components > other
 
-    def __ge__(self, other):
-        return self.components >= other
+class PydanticBaseEnvSettingsSource(PydanticBaseSettingsSource):
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        case_sensitive: bool | None = None,
+        env_prefix: str | None = None,
+        env_ignore_empty: bool | None = None,
+        env_parse_none_str: str | None = None,
+        env_parse_enums: bool | None = None,
+    ) -> None:
+        super().__init__(settings_cls)
+        self.case_sensitive = case_sensitive if case_sensitive is not None else self.config.get('case_sensitive', False)
+        self.env_prefix = env_prefix if env_prefix is not None else self.config.get('env_prefix', '')
+        self.env_ignore_empty = (
+            env_ignore_empty if env_ignore_empty is not None else self.config.get('env_ignore_empty', False)
+        )
+        self.env_parse_none_str = (
+            env_parse_none_str if env_parse_none_str is not None else self.config.get('env_parse_none_str')
+        )
+        self.env_parse_enums = env_parse_enums if env_parse_enums is not None else self.config.get('env_parse_enums')
 
-    def __bool__(self):
-        return bool(self.components)
+    def _apply_case_sensitive(self, value: str) -> str:
+        return value.lower() if not self.case_sensitive else value
 
-    @property
-    def components(self):
-        raise error.PyAsn1Error('Method not implemented')
-
-    def _cloneComponentValues(self, myClone, cloneValueFlag):
-        pass
-
-    def clone(self, **kwargs):
-        """Create a modified version of |ASN.1| schema object.
-
-        The `clone()` method accepts the same set arguments as |ASN.1|
-        class takes on instantiation except that all arguments
-        of the `clone()` method are optional.
-
-        Whatever arguments are supplied, they are used to create a copy
-        of `self` taking precedence over the ones used to instantiate `self`.
-
-        Possible values of `self` are never copied over thus `clone()` can
-        only create a new schema object.
-
-        Returns
-        -------
-        :
-            new instance of |ASN.1| type/value
-
-        Note
-        ----
-        Due to the mutable nature of the |ASN.1| object, even if no arguments
-        are supplied, a new |ASN.1| object will be created and returned.
+    def _extract_field_info(self, field: FieldInfo, field_name: str) -> list[tuple[str, str, bool]]:
         """
-        cloneValueFlag = kwargs.pop('cloneValueFlag', False)
+        Extracts field info. This info is used to get the value of field from environment variables.
 
-        initializers = self.readOnly.copy()
-        initializers.update(kwargs)
+        It returns a list of tuples, each tuple contains:
+            * field_key: The key of field that has to be used in model creation.
+            * env_name: The environment variable name of the field.
+            * value_is_complex: A flag to determine whether the value from environment variable
+              is complex and has to be parsed.
 
-        clone = self.__class__(**initializers)
+        Args:
+            field (FieldInfo): The field.
+            field_name (str): The field name.
 
-        if cloneValueFlag:
-            self._cloneComponentValues(clone, cloneValueFlag)
-
-        return clone
-
-    def subtype(self, **kwargs):
-        """Create a specialization of |ASN.1| schema object.
-
-        The `subtype()` method accepts the same set arguments as |ASN.1|
-        class takes on instantiation except that all parameters
-        of the `subtype()` method are optional.
-
-        With the exception of the arguments described below, the rest of
-        supplied arguments they are used to create a copy of `self` taking
-        precedence over the ones used to instantiate `self`.
-
-        The following arguments to `subtype()` create a ASN.1 subtype out of
-        |ASN.1| type.
-
-        Other Parameters
-        ----------------
-        implicitTag: :py:class:`~pyasn1.type.tag.Tag`
-            Implicitly apply given ASN.1 tag object to `self`'s
-            :py:class:`~pyasn1.type.tag.TagSet`, then use the result as
-            new object's ASN.1 tag(s).
-
-        explicitTag: :py:class:`~pyasn1.type.tag.Tag`
-            Explicitly apply given ASN.1 tag object to `self`'s
-            :py:class:`~pyasn1.type.tag.TagSet`, then use the result as
-            new object's ASN.1 tag(s).
-
-        subtypeSpec: :py:class:`~pyasn1.type.constraint.ConstraintsIntersection`
-            Add ASN.1 constraints object to one of the `self`'s, then
-            use the result as new object's ASN.1 constraints.
-
-
-        Returns
-        -------
-        :
-            new instance of |ASN.1| type/value
-
-        Note
-        ----
-        Due to the mutable nature of the |ASN.1| object, even if no arguments
-        are supplied, a new |ASN.1| object will be created and returned.
+        Returns:
+            list[tuple[str, str, bool]]: List of tuples, each tuple contains field_key, env_name, and value_is_complex.
         """
+        field_info: list[tuple[str, str, bool]] = []
+        if isinstance(field.validation_alias, (AliasChoices, AliasPath)):
+            v_alias: str | list[str | int] | list[list[str | int]] | None = field.validation_alias.convert_to_aliases()
+        else:
+            v_alias = field.validation_alias
 
-        initializers = self.readOnly.copy()
+        if v_alias:
+            if isinstance(v_alias, list):  # AliasChoices, AliasPath
+                for alias in v_alias:
+                    if isinstance(alias, str):  # AliasPath
+                        field_info.append((alias, self._apply_case_sensitive(alias), True if len(alias) > 1 else False))
+                    elif isinstance(alias, list):  # AliasChoices
+                        first_arg = cast(str, alias[0])  # first item of an AliasChoices must be a str
+                        field_info.append(
+                            (first_arg, self._apply_case_sensitive(first_arg), True if len(alias) > 1 else False)
+                        )
+            else:  # string validation alias
+                field_info.append((v_alias, self._apply_case_sensitive(v_alias), False))
 
-        cloneValueFlag = kwargs.pop('cloneValueFlag', False)
+        if not v_alias or self.config.get('populate_by_name', False):
+            if is_union_origin(get_origin(field.annotation)) and _union_is_complex(field.annotation, field.metadata):
+                field_info.append((field_name, self._apply_case_sensitive(self.env_prefix + field_name), True))
+            else:
+                field_info.append((field_name, self._apply_case_sensitive(self.env_prefix + field_name), False))
 
-        implicitTag = kwargs.pop('implicitTag', None)
-        if implicitTag is not None:
-            initializers['tagSet'] = self.tagSet.tagImplicitly(implicitTag)
+        return field_info
 
-        explicitTag = kwargs.pop('explicitTag', None)
-        if explicitTag is not None:
-            initializers['tagSet'] = self.tagSet.tagExplicitly(explicitTag)
+    def _replace_field_names_case_insensitively(self, field: FieldInfo, field_values: dict[str, Any]) -> dict[str, Any]:
+        """
+        Replace field names in values dict by looking in models fields insensitively.
 
-        for arg, option in kwargs.items():
-            initializers[arg] += option
+        By having the following models:
 
-        clone = self.__class__(**initializers)
+            ```py
+            class SubSubSub(BaseModel):
+                VaL3: str
 
-        if cloneValueFlag:
-            self._cloneComponentValues(clone, cloneValueFlag)
+            class SubSub(BaseModel):
+                Val2: str
+                SUB_sub_SuB: SubSubSub
 
-        return clone
+            class Sub(BaseModel):
+                VAL1: str
+                SUB_sub: SubSub
 
-    def getComponentByPosition(self, idx):
-        raise error.PyAsn1Error('Method not implemented')
+            class Settings(BaseSettings):
+                nested: Sub
 
-    def setComponentByPosition(self, idx, value, verifyConstraints=True):
-        raise error.PyAsn1Error('Method not implemented')
+                model_config = SettingsConfigDict(env_nested_delimiter='__')
+            ```
 
-    def setComponents(self, *args, **kwargs):
-        for idx, value in enumerate(args):
-            self[idx] = value
-        for k in kwargs:
-            self[k] = kwargs[k]
-        return self
+        Then:
+            _replace_field_names_case_insensitively(
+                field,
+                {"val1": "v1", "sub_SUB": {"VAL2": "v2", "sub_SUB_sUb": {"vAl3": "v3"}}}
+            )
+            Returns {'VAL1': 'v1', 'SUB_sub': {'Val2': 'v2', 'SUB_sub_SuB': {'VaL3': 'v3'}}}
+        """
+        values: dict[str, Any] = {}
 
-    # backward compatibility
+        for name, value in field_values.items():
+            sub_model_field: FieldInfo | None = None
 
-    def setDefaultComponents(self):
-        pass
+            annotation = field.annotation
 
-    def getComponentType(self):
-        return self.componentType
+            # If field is Optional, we need to find the actual type
+            if is_union_origin(get_origin(field.annotation)):
+                args = get_args(annotation)
+                if len(args) == 2 and type(None) in args:
+                    for arg in args:
+                        if arg is not None:
+                            annotation = arg
+                            break
 
-    # backward compatibility, unused
-    def verifySizeSpec(self):
-        self.subtypeSpec(self)
+            # This is here to make mypy happy
+            # Item "None" of "Optional[Type[Any]]" has no attribute "model_fields"
+            if not annotation or not hasattr(annotation, 'model_fields'):
+                values[name] = value
+                continue
+            else:
+                model_fields: dict[str, FieldInfo] = annotation.model_fields
+
+            # Find field in sub model by looking in fields case insensitively
+            field_key: str | None = None
+            for sub_model_field_name, sub_model_field in model_fields.items():
+                aliases, _ = _get_alias_names(sub_model_field_name, sub_model_field)
+                _search = (alias for alias in aliases if alias.lower() == name.lower())
+                if field_key := next(_search, None):
+                    break
+
+            if not field_key:
+                values[name] = value
+                continue
+
+            if (
+                sub_model_field is not None
+                and _lenient_issubclass(sub_model_field.annotation, BaseModel)
+                and isinstance(value, dict)
+            ):
+                values[field_key] = self._replace_field_names_case_insensitively(sub_model_field, value)
+            else:
+                values[field_key] = value
+
+        return values
+
+    def _replace_env_none_type_values(self, field_value: dict[str, Any]) -> dict[str, Any]:
+        """
+        Recursively parse values that are of "None" type(EnvNoneType) to `None` type(None).
+        """
+        values: dict[str, Any] = {}
+
+        for key, value in field_value.items():
+            if not isinstance(value, EnvNoneType):
+                values[key] = value if not isinstance(value, dict) else self._replace_env_none_type_values(value)
+            else:
+                values[key] = None
+
+        return values
+
+    def _get_resolved_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        """
+        Gets the value, the preferred alias key for model creation, and a flag to determine whether value
+        is complex.
+
+        Note:
+            In V3, this method should either be made public, or, this method should be removed and the
+            abstract method get_field_value should be updated to include a "use_preferred_alias" flag.
+
+        Args:
+            field: The field.
+            field_name: The field name.
+
+        Returns:
+            A tuple that contains the value, preferred key and a flag to determine whether value is complex.
+        """
+        field_value, field_key, value_is_complex = self.get_field_value(field, field_name)
+        if not (value_is_complex or (self.config.get('populate_by_name', False) and (field_key == field_name))):
+            field_infos = self._extract_field_info(field, field_name)
+            preferred_key, *_ = field_infos[0]
+            return field_value, preferred_key, value_is_complex
+        return field_value, field_key, value_is_complex
+
+    def __call__(self) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+
+        for field_name, field in self.settings_cls.model_fields.items():
+            try:
+                field_value, field_key, value_is_complex = self._get_resolved_field_value(field, field_name)
+            except Exception as e:
+                raise SettingsError(
+                    f'error getting value for field "{field_name}" from source "{self.__class__.__name__}"'
+                ) from e
+
+            try:
+                field_value = self.prepare_field_value(field_name, field, field_value, value_is_complex)
+            except ValueError as e:
+                raise SettingsError(
+                    f'error parsing value for field "{field_name}" from source "{self.__class__.__name__}"'
+                ) from e
+
+            if field_value is not None:
+                if self.env_parse_none_str is not None:
+                    if isinstance(field_value, dict):
+                        field_value = self._replace_env_none_type_values(field_value)
+                    elif isinstance(field_value, EnvNoneType):
+                        field_value = None
+                if (
+                    not self.case_sensitive
+                    # and _lenient_issubclass(field.annotation, BaseModel)
+                    and isinstance(field_value, dict)
+                ):
+                    data[field_key] = self._replace_field_names_case_insensitively(field, field_value)
+                else:
+                    data[field_key] = field_value
+
+        return data
 
 
-        # Backward compatibility
-AbstractConstructedAsn1Item = ConstructedAsn1Type
+__all__ = [
+    'ConfigFileSourceMixin',
+    'DefaultSettingsSource',
+    'InitSettingsSource',
+    'PydanticBaseEnvSettingsSource',
+    'PydanticBaseSettingsSource',
+    'SettingsError',
+]
