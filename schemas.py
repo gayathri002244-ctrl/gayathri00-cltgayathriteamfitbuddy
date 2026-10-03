@@ -1,147 +1,179 @@
-from __future__ import annotations
+from typing import Literal
 
-import inspect
-import re
-from typing import Any, Callable, NamedTuple
-
-from starlette.requests import Request
-from starlette.responses import Response
-from starlette.routing import BaseRoute, Host, Mount, Route
-
-try:
-    import yaml
-except ModuleNotFoundError:  # pragma: no cover
-    yaml = None  # type: ignore[assignment]
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+)
 
 
-class OpenAPIResponse(Response):
-    media_type = "application/vnd.oai.openapi"
-
-    def render(self, content: Any) -> bytes:
-        assert yaml is not None, "`pyyaml` must be installed to use OpenAPIResponse."
-        assert isinstance(content, dict), "The schema passed to OpenAPIResponse should be a dictionary."
-        return yaml.dump(content, default_flow_style=False).encode("utf-8")
-
-
-class EndpointInfo(NamedTuple):
-    path: str
-    http_method: str
-    func: Callable[..., Any]
+Goal = Literal[
+    "weight loss",
+    "muscle gain",
+    "general wellness",
+    "flexibility",
+    "fitness",
+]
 
 
-_remove_converter_pattern = re.compile(r":\w+}")
+Intensity = Literal[
+    "low",
+    "medium",
+    "high",
+]
 
 
-class BaseSchemaGenerator:
-    def get_schema(self, routes: list[BaseRoute]) -> dict[str, Any]:
-        raise NotImplementedError()  # pragma: no cover
+class UserInput(BaseModel):
+    """
+    Input information supplied by a FitBuddy user.
+    """
 
-    def get_endpoints(self, routes: list[BaseRoute]) -> list[EndpointInfo]:
-        """
-        Given the routes, yields the following information:
+    user_id: str = Field(
+        min_length=2,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
 
-        - path
-            eg: /users/
-        - http_method
-            one of 'get', 'post', 'put', 'patch', 'delete', 'options'
-        - func
-            method ready to extract the docstring
-        """
-        endpoints_info: list[EndpointInfo] = []
+    name: str = Field(
+        min_length=2,
+        max_length=120,
+    )
 
-        for route in routes:
-            if isinstance(route, (Mount, Host)):
-                routes = route.routes or []
-                if isinstance(route, Mount):
-                    path = self._remove_converter(route.path)
-                else:
-                    path = ""
-                sub_endpoints = [
-                    EndpointInfo(
-                        path="".join((path, sub_endpoint.path)),
-                        http_method=sub_endpoint.http_method,
-                        func=sub_endpoint.func,
-                    )
-                    for sub_endpoint in self.get_endpoints(routes)
-                ]
-                endpoints_info.extend(sub_endpoints)
+    age: int = Field(
+        ge=13,
+        le=100,
+    )
 
-            elif not isinstance(route, Route) or not route.include_in_schema:
-                continue
+    weight: float = Field(
+        gt=20,
+        le=500,
+    )
 
-            elif inspect.isfunction(route.endpoint) or inspect.ismethod(route.endpoint):
-                path = self._remove_converter(route.path)
-                for method in route.methods or ["GET"]:
-                    if method == "HEAD":
-                        continue
-                    endpoints_info.append(EndpointInfo(path, method.lower(), route.endpoint))
-            else:
-                path = self._remove_converter(route.path)
-                for method in ["get", "post", "put", "patch", "delete", "options"]:
-                    if not hasattr(route.endpoint, method):
-                        continue
-                    func = getattr(route.endpoint, method)
-                    endpoints_info.append(EndpointInfo(path, method.lower(), func))
+    goal: Goal
 
-        return endpoints_info
+    intensity: Intensity
 
-    def _remove_converter(self, path: str) -> str:
-        """
-        Remove the converter from the path.
-        For example, a route like this:
-            Route("/users/{id:int}", endpoint=get_user, methods=["GET"])
-        Should be represented as `/users/{id}` in the OpenAPI schema.
-        """
-        return _remove_converter_pattern.sub("}", path)
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str) -> str:
 
-    def parse_docstring(self, func_or_method: Callable[..., Any]) -> dict[str, Any]:
-        """
-        Given a function, parse the docstring as YAML and return a dictionary of info.
-        """
-        docstring = func_or_method.__doc__
-        if not docstring:
-            return {}
+        value = " ".join(
+            value.split()
+        )
 
-        assert yaml is not None, "`pyyaml` must be installed to use parse_docstring."
+        if not value:
+            raise ValueError(
+                "Name cannot be empty"
+            )
 
-        # We support having regular docstrings before the schema
-        # definition. Here we return just the schema part from
-        # the docstring.
-        docstring = docstring.split("---")[-1]
-
-        parsed = yaml.safe_load(docstring)
-
-        if not isinstance(parsed, dict):
-            # A regular docstring (not yaml formatted) can return
-            # a simple string here, which wouldn't follow the schema.
-            return {}
-
-        return parsed
-
-    def OpenAPIResponse(self, request: Request) -> Response:
-        routes = request.app.routes
-        schema = self.get_schema(routes=routes)
-        return OpenAPIResponse(schema)
+        return value
 
 
-class SchemaGenerator(BaseSchemaGenerator):
-    def __init__(self, base_schema: dict[str, Any]) -> None:
-        self.base_schema = base_schema
+class FeedbackRequest(BaseModel):
+    """
+    User feedback used to regenerate a plan.
+    """
 
-    def get_schema(self, routes: list[BaseRoute]) -> dict[str, Any]:
-        schema = dict(self.base_schema)
-        schema.setdefault("paths", {})
-        endpoints_info = self.get_endpoints(routes)
+    user_id: str = Field(
+        min_length=2,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
 
-        for endpoint in endpoints_info:
-            parsed = self.parse_docstring(endpoint.func)
+    feedback: str = Field(
+        min_length=5,
+        max_length=1200,
+    )
 
-            if not parsed:
-                continue
+    @field_validator("feedback")
+    @classmethod
+    def clean_feedback(cls, value: str) -> str:
 
-            if endpoint.path not in schema["paths"]:
-                schema["paths"][endpoint.path] = {}
+        value = " ".join(
+            value.split()
+        )
 
-            schema["paths"][endpoint.path][endpoint.http_method] = parsed
+        if not value:
+            raise ValueError(
+                "Feedback cannot be empty"
+            )
 
-        return schema
+        return value
+
+
+class Exercise(BaseModel):
+    """
+    Individual exercise.
+    """
+
+    name: str
+
+    sets: str
+
+    reps_or_duration: str
+
+    rest: str
+
+
+class WorkoutDay(BaseModel):
+    """
+    One day of the seven-day workout plan.
+    """
+
+    day: str
+
+    focus: str
+
+    warmup: str
+
+    exercises: list[Exercise]
+
+    cooldown: str
+
+    @field_validator("exercises")
+    @classmethod
+    def validate_exercises(cls, value: list[Exercise]) -> list[Exercise]:
+        if not (1 <= len(value) <= 8):
+            raise ValueError("Exercises count must be between 1 and 8")
+        return value
+
+
+class WorkoutPlan(BaseModel):
+    """
+    Complete seven-day plan.
+    """
+
+    days: list[WorkoutDay]
+
+    general_note: str
+
+    @field_validator("days")
+    @classmethod
+    def validate_days(cls, value: list[WorkoutDay]) -> list[WorkoutDay]:
+        if len(value) != 7:
+            raise ValueError("Workout plan must contain exactly 7 days")
+        return value
+
+
+class PlanResponse(BaseModel):
+    """
+    API response for plan generation.
+    """
+
+    user_id: str
+
+    name: str
+
+    age: int
+
+    weight: float
+
+    goal: str
+
+    intensity: str
+
+    workout_plan: WorkoutPlan
+
+    nutrition_tip: str
+
+    plan_id: int
