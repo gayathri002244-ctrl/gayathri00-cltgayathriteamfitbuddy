@@ -1,221 +1,168 @@
-import re
-import warnings
-from dataclasses import is_dataclass
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    MutableMapping,
-    Optional,
-    Set,
-    Type,
-    Union,
-    cast,
-)
-from weakref import WeakKeyDictionary
+# Copyright 2020 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-import fastapi
-from fastapi._compat import (
-    PYDANTIC_V2,
-    BaseConfig,
-    ModelField,
-    PydanticSchemaGenerationError,
-    Undefined,
-    UndefinedType,
-    Validator,
-    lenient_issubclass,
-)
-from fastapi.datastructures import DefaultPlaceholder, DefaultType
-from pydantic import BaseModel, create_model
-from pydantic.fields import FieldInfo
-from typing_extensions import Literal
+"""OAuth 2.0 Utilities.
 
-if TYPE_CHECKING:  # pragma: nocover
-    from .routing import APIRoute
+This module provides implementations for various OAuth 2.0 utilities.
+This includes `OAuth error handling`_ and
+`Client authentication for OAuth flows`_.
 
-# Cache for `create_cloned_field`
-_CLONED_TYPES_CACHE: MutableMapping[Type[BaseModel], Type[BaseModel]] = (
-    WeakKeyDictionary()
-)
+OAuth error handling
+--------------------
+This will define interfaces for handling OAuth related error responses as
+stated in `RFC 6749 section 5.2`_.
+This will include a common function to convert these HTTP error responses to a
+:class:`google.auth.exceptions.OAuthError` exception.
 
 
-def is_body_allowed_for_status_code(status_code: Union[int, str, None]) -> bool:
-    if status_code is None:
-        return True
-    # Ref: https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.1.0.md#patterned-fields-1
-    if status_code in {
-        "default",
-        "1XX",
-        "2XX",
-        "3XX",
-        "4XX",
-        "5XX",
-    }:
-        return True
-    current_status_code = int(status_code)
-    return not (current_status_code < 200 or current_status_code in {204, 205, 304})
+Client authentication for OAuth flows
+-------------------------------------
+We introduce an interface for defining client authentication credentials based
+on `RFC 6749 section 2.3.1`_. This will expose the following
+capabilities:
+
+    * Ability to support basic authentication via request header.
+    * Ability to support bearer token authentication via request header.
+    * Ability to support client ID / secret authentication via request body.
+
+.. _RFC 6749 section 2.3.1: https://tools.ietf.org/html/rfc6749#section-2.3.1
+.. _RFC 6749 section 5.2: https://tools.ietf.org/html/rfc6749#section-5.2
+"""
+
+import abc
+import base64
+import enum
+import json
+
+from google.auth import exceptions
 
 
-def get_path_param_names(path: str) -> Set[str]:
-    return set(re.findall("{(.*?)}", path))
+# OAuth client authentication based on
+# https://tools.ietf.org/html/rfc6749#section-2.3.
+class ClientAuthType(enum.Enum):
+    basic = 1
+    request_body = 2
 
 
-def create_model_field(
-    name: str,
-    type_: Any,
-    class_validators: Optional[Dict[str, Validator]] = None,
-    default: Optional[Any] = Undefined,
-    required: Union[bool, UndefinedType] = Undefined,
-    model_config: Type[BaseConfig] = BaseConfig,
-    field_info: Optional[FieldInfo] = None,
-    alias: Optional[str] = None,
-    mode: Literal["validation", "serialization"] = "validation",
-) -> ModelField:
-    class_validators = class_validators or {}
-    if PYDANTIC_V2:
-        field_info = field_info or FieldInfo(
-            annotation=type_, default=default, alias=alias
-        )
-    else:
-        field_info = field_info or FieldInfo()
-    kwargs = {"name": name, "field_info": field_info}
-    if PYDANTIC_V2:
-        kwargs.update({"mode": mode})
-    else:
-        kwargs.update(
-            {
-                "type_": type_,
-                "class_validators": class_validators,
-                "default": default,
-                "required": required,
-                "model_config": model_config,
-                "alias": alias,
-            }
-        )
-    try:
-        return ModelField(**kwargs)  # type: ignore[arg-type]
-    except (RuntimeError, PydanticSchemaGenerationError):
-        raise fastapi.exceptions.FastAPIError(
-            "Invalid args for response field! Hint: "
-            f"check that {type_} is a valid Pydantic field type. "
-            "If you are using a return type annotation that is not a valid Pydantic "
-            "field (e.g. Union[Response, dict, None]) you can disable generating the "
-            "response model from the type annotation with the path operation decorator "
-            "parameter response_model=None. Read more: "
-            "https://fastapi.tiangolo.com/tutorial/response-model/"
-        ) from None
+class ClientAuthentication(object):
+    """Defines the client authentication credentials for basic and request-body
+    types based on https://tools.ietf.org/html/rfc6749#section-2.3.1.
+    """
+
+    def __init__(self, client_auth_type, client_id, client_secret=None):
+        """Instantiates a client authentication object containing the client ID
+        and secret credentials for basic and response-body auth.
+
+        Args:
+            client_auth_type (google.oauth2.oauth_utils.ClientAuthType): The
+                client authentication type.
+            client_id (str): The client ID.
+            client_secret (Optional[str]): The client secret.
+        """
+        self.client_auth_type = client_auth_type
+        self.client_id = client_id
+        self.client_secret = client_secret
 
 
-def create_cloned_field(
-    field: ModelField,
-    *,
-    cloned_types: Optional[MutableMapping[Type[BaseModel], Type[BaseModel]]] = None,
-) -> ModelField:
-    if PYDANTIC_V2:
-        return field
-    # cloned_types caches already cloned types to support recursive models and improve
-    # performance by avoiding unnecessary cloning
-    if cloned_types is None:
-        cloned_types = _CLONED_TYPES_CACHE
+class OAuthClientAuthHandler(metaclass=abc.ABCMeta):
+    """Abstract class for handling client authentication in OAuth-based
+    operations.
+    """
 
-    original_type = field.type_
-    if is_dataclass(original_type) and hasattr(original_type, "__pydantic_model__"):
-        original_type = original_type.__pydantic_model__
-    use_type = original_type
-    if lenient_issubclass(original_type, BaseModel):
-        original_type = cast(Type[BaseModel], original_type)
-        use_type = cloned_types.get(original_type)
-        if use_type is None:
-            use_type = create_model(original_type.__name__, __base__=original_type)
-            cloned_types[original_type] = use_type
-            for f in original_type.__fields__.values():
-                use_type.__fields__[f.name] = create_cloned_field(
-                    f, cloned_types=cloned_types
-                )
-    new_field = create_model_field(name=field.name, type_=use_type)
-    new_field.has_alias = field.has_alias  # type: ignore[attr-defined]
-    new_field.alias = field.alias  # type: ignore[misc]
-    new_field.class_validators = field.class_validators  # type: ignore[attr-defined]
-    new_field.default = field.default  # type: ignore[misc]
-    new_field.default_factory = field.default_factory  # type: ignore[attr-defined]
-    new_field.required = field.required  # type: ignore[misc]
-    new_field.model_config = field.model_config  # type: ignore[attr-defined]
-    new_field.field_info = field.field_info
-    new_field.allow_none = field.allow_none  # type: ignore[attr-defined]
-    new_field.validate_always = field.validate_always  # type: ignore[attr-defined]
-    if field.sub_fields:  # type: ignore[attr-defined]
-        new_field.sub_fields = [  # type: ignore[attr-defined]
-            create_cloned_field(sub_field, cloned_types=cloned_types)
-            for sub_field in field.sub_fields  # type: ignore[attr-defined]
-        ]
-    if field.key_field:  # type: ignore[attr-defined]
-        new_field.key_field = create_cloned_field(  # type: ignore[attr-defined]
-            field.key_field,  # type: ignore[attr-defined]
-            cloned_types=cloned_types,
-        )
-    new_field.validators = field.validators  # type: ignore[attr-defined]
-    new_field.pre_validators = field.pre_validators  # type: ignore[attr-defined]
-    new_field.post_validators = field.post_validators  # type: ignore[attr-defined]
-    new_field.parse_json = field.parse_json  # type: ignore[attr-defined]
-    new_field.shape = field.shape  # type: ignore[attr-defined]
-    new_field.populate_validators()  # type: ignore[attr-defined]
-    return new_field
+    def __init__(self, client_authentication=None):
+        """Instantiates an OAuth client authentication handler.
 
+        Args:
+            client_authentication (Optional[google.oauth2.utils.ClientAuthentication]):
+                The OAuth client authentication credentials if available.
+        """
+        super(OAuthClientAuthHandler, self).__init__()
+        self._client_authentication = client_authentication
 
-def generate_operation_id_for_path(
-    *, name: str, path: str, method: str
-) -> str:  # pragma: nocover
-    warnings.warn(
-        "fastapi.utils.generate_operation_id_for_path() was deprecated, "
-        "it is not used internally, and will be removed soon",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    operation_id = f"{name}{path}"
-    operation_id = re.sub(r"\W", "_", operation_id)
-    operation_id = f"{operation_id}_{method.lower()}"
-    return operation_id
+    def apply_client_authentication_options(
+        self, headers, request_body=None, bearer_token=None
+    ):
+        """Applies client authentication on the OAuth request's headers or POST
+        body.
 
+        Args:
+            headers (Mapping[str, str]): The HTTP request header.
+            request_body (Optional[Mapping[str, str]]): The HTTP request body
+                dictionary. For requests that do not support request body, this
+                is None and will be ignored.
+            bearer_token (Optional[str]): The optional bearer token.
+        """
+        # Inject authenticated header.
+        self._inject_authenticated_headers(headers, bearer_token)
+        # Inject authenticated request body.
+        if bearer_token is None:
+            self._inject_authenticated_request_body(request_body)
 
-def generate_unique_id(route: "APIRoute") -> str:
-    operation_id = f"{route.name}{route.path_format}"
-    operation_id = re.sub(r"\W", "_", operation_id)
-    assert route.methods
-    operation_id = f"{operation_id}_{list(route.methods)[0].lower()}"
-    return operation_id
-
-
-def deep_dict_update(main_dict: Dict[Any, Any], update_dict: Dict[Any, Any]) -> None:
-    for key, value in update_dict.items():
-        if (
-            key in main_dict
-            and isinstance(main_dict[key], dict)
-            and isinstance(value, dict)
-        ):
-            deep_dict_update(main_dict[key], value)
+    def _inject_authenticated_headers(self, headers, bearer_token=None):
+        if bearer_token is not None:
+            headers["Authorization"] = "Bearer %s" % bearer_token
         elif (
-            key in main_dict
-            and isinstance(main_dict[key], list)
-            and isinstance(update_dict[key], list)
+            self._client_authentication is not None
+            and self._client_authentication.client_auth_type is ClientAuthType.basic
         ):
-            main_dict[key] = main_dict[key] + update_dict[key]
-        else:
-            main_dict[key] = value
+            username = self._client_authentication.client_id
+            password = self._client_authentication.client_secret or ""
+
+            credentials = base64.b64encode(
+                ("%s:%s" % (username, password)).encode()
+            ).decode()
+            headers["Authorization"] = "Basic %s" % credentials
+
+    def _inject_authenticated_request_body(self, request_body):
+        if (
+            self._client_authentication is not None
+            and self._client_authentication.client_auth_type
+            is ClientAuthType.request_body
+        ):
+            if request_body is None:
+                raise exceptions.OAuthError(
+                    "HTTP request does not support request-body"
+                )
+            else:
+                request_body["client_id"] = self._client_authentication.client_id
+                request_body["client_secret"] = (
+                    self._client_authentication.client_secret or ""
+                )
 
 
-def get_value_or_default(
-    first_item: Union[DefaultPlaceholder, DefaultType],
-    *extra_items: Union[DefaultPlaceholder, DefaultType],
-) -> Union[DefaultPlaceholder, DefaultType]:
+def handle_error_response(response_body):
+    """Translates an error response from an OAuth operation into an
+    OAuthError exception.
+
+    Args:
+        response_body (str): The decoded response data.
+
+    Raises:
+        google.auth.exceptions.OAuthError
     """
-    Pass items or `DefaultPlaceholder`s by descending priority.
+    try:
+        error_components = []
+        error_data = json.loads(response_body)
 
-    The first one to _not_ be a `DefaultPlaceholder` will be returned.
+        error_components.append("Error code {}".format(error_data["error"]))
+        if "error_description" in error_data:
+            error_components.append(": {}".format(error_data["error_description"]))
+        if "error_uri" in error_data:
+            error_components.append(" - {}".format(error_data["error_uri"]))
+        error_details = "".join(error_components)
+    # If no details could be extracted, use the response data.
+    except (KeyError, ValueError):
+        error_details = response_body
 
-    Otherwise, the first item (a `DefaultPlaceholder`) will be returned.
-    """
-    items = (first_item,) + extra_items
-    for item in items:
-        if not isinstance(item, DefaultPlaceholder):
-            return item
-    return first_item
+    raise exceptions.OAuthError(error_details, response_body)
