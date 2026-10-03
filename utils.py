@@ -1,56 +1,51 @@
 from __future__ import annotations
 
-import asyncio
-import urllib.parse
-
-from uvicorn._types import WWWScope
-
-
-class ClientDisconnected(OSError): ...
+import base64
+import hashlib
+import secrets
+import sys
 
 
-def get_remote_addr(transport: asyncio.Transport) -> tuple[str, int] | None:
-    socket_info = transport.get_extra_info("socket")
-    if socket_info is not None:
-        try:
-            info = socket_info.getpeername()
-            return (str(info[0]), int(info[1])) if isinstance(info, tuple) else None
-        except OSError:  # pragma: no cover
-            # This case appears to inconsistently occur with uvloop
-            # bound to a unix domain socket.
-            return None
-
-    info = transport.get_extra_info("peername")
-    if info is not None and isinstance(info, (list, tuple)) and len(info) == 2:
-        return (str(info[0]), int(info[1]))
-    return None
+__all__ = ["accept_key", "apply_mask"]
 
 
-def get_local_addr(transport: asyncio.Transport) -> tuple[str, int] | None:
-    socket_info = transport.get_extra_info("socket")
-    if socket_info is not None:
-        info = socket_info.getsockname()
-
-        return (str(info[0]), int(info[1])) if isinstance(info, tuple) else None
-    info = transport.get_extra_info("sockname")
-    if info is not None and isinstance(info, (list, tuple)) and len(info) == 2:
-        return (str(info[0]), int(info[1]))
-    return None
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
-def is_ssl(transport: asyncio.Transport) -> bool:
-    return bool(transport.get_extra_info("sslcontext"))
+def generate_key() -> str:
+    """
+    Generate a random key for the Sec-WebSocket-Key header.
+
+    """
+    key = secrets.token_bytes(16)
+    return base64.b64encode(key).decode()
 
 
-def get_client_addr(scope: WWWScope) -> str:
-    client = scope.get("client")
-    if not client:
-        return ""
-    return "%s:%d" % client
+def accept_key(key: str) -> str:
+    """
+    Compute the value of the Sec-WebSocket-Accept header.
+
+    Args:
+        key: Value of the Sec-WebSocket-Key header.
+
+    """
+    sha1 = hashlib.sha1((key + GUID).encode()).digest()
+    return base64.b64encode(sha1).decode()
 
 
-def get_path_with_query_string(scope: WWWScope) -> str:
-    path_with_query_string = urllib.parse.quote(scope["path"])
-    if scope["query_string"]:
-        path_with_query_string = "{}?{}".format(path_with_query_string, scope["query_string"].decode("ascii"))
-    return path_with_query_string
+def apply_mask(data: bytes, mask: bytes) -> bytes:
+    """
+    Apply masking to the data of a WebSocket message.
+
+    Args:
+        data: Data to mask.
+        mask: 4-bytes mask.
+
+    """
+    if len(mask) != 4:
+        raise ValueError("mask must contain 4 bytes")
+
+    data_int = int.from_bytes(data, sys.byteorder)
+    mask_repeated = mask * (len(data) // 4) + mask[: len(data) % 4]
+    mask_int = int.from_bytes(mask_repeated, sys.byteorder)
+    return (data_int ^ mask_int).to_bytes(len(data), sys.byteorder)

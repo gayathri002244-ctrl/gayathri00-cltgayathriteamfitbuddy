@@ -1,379 +1,427 @@
 from __future__ import annotations
 
-import enum
-import logging
-import ssl
-import time
-import types
-import typing
+import dataclasses
+import os
+import re
+import sys
+import warnings
+from collections.abc import Generator
+from typing import Callable
 
-import h11
-
-from .._backends.base import AsyncNetworkStream
-from .._exceptions import (
-    ConnectionNotAvailable,
-    LocalProtocolError,
-    RemoteProtocolError,
-    WriteError,
-    map_exceptions,
-)
-from .._models import Origin, Request, Response
-from .._synchronization import AsyncLock, AsyncShieldCancellation
-from .._trace import Trace
-from .interfaces import AsyncConnectionInterface
-
-logger = logging.getLogger("httpcore.http11")
+from .datastructures import Headers
+from .exceptions import SecurityError
+from .version import version as websockets_version
 
 
-# A subset of `h11.Event` types supported by `_send_event`
-H11SendEvent = typing.Union[
-    h11.Request,
-    h11.Data,
-    h11.EndOfMessage,
+__all__ = [
+    "SERVER",
+    "USER_AGENT",
+    "Request",
+    "Response",
 ]
 
 
-class HTTPConnectionState(enum.IntEnum):
-    NEW = 0
-    ACTIVE = 1
-    IDLE = 2
-    CLOSED = 3
+PYTHON_VERSION = "{}.{}".format(*sys.version_info)
+
+# User-Agent header for HTTP requests.
+USER_AGENT = os.environ.get(
+    "WEBSOCKETS_USER_AGENT",
+    f"Python/{PYTHON_VERSION} websockets/{websockets_version}",
+)
+
+# Server header for HTTP responses.
+SERVER = os.environ.get(
+    "WEBSOCKETS_SERVER",
+    f"Python/{PYTHON_VERSION} websockets/{websockets_version}",
+)
+
+# Maximum total size of headers is around 128 * 8 KiB = 1 MiB.
+MAX_NUM_HEADERS = int(os.environ.get("WEBSOCKETS_MAX_NUM_HEADERS", "128"))
+
+# Limit request line and header lines. 8KiB is the most common default
+# configuration of popular HTTP servers.
+MAX_LINE_LENGTH = int(os.environ.get("WEBSOCKETS_MAX_LINE_LENGTH", "8192"))
+
+# Support for HTTP response bodies is intended to read an error message
+# returned by a server. It isn't designed to perform large file transfers.
+MAX_BODY_SIZE = int(os.environ.get("WEBSOCKETS_MAX_BODY_SIZE", "1_048_576"))  # 1 MiB
 
 
-class AsyncHTTP11Connection(AsyncConnectionInterface):
-    READ_NUM_BYTES = 64 * 1024
-    MAX_INCOMPLETE_EVENT_SIZE = 100 * 1024
+def d(value: bytes) -> str:
+    """
+    Decode a bytestring for interpolating into an error message.
 
-    def __init__(
-        self,
-        origin: Origin,
-        stream: AsyncNetworkStream,
-        keepalive_expiry: float | None = None,
-    ) -> None:
-        self._origin = origin
-        self._network_stream = stream
-        self._keepalive_expiry: float | None = keepalive_expiry
-        self._expire_at: float | None = None
-        self._state = HTTPConnectionState.NEW
-        self._state_lock = AsyncLock()
-        self._request_count = 0
-        self._h11_state = h11.Connection(
-            our_role=h11.CLIENT,
-            max_incomplete_event_size=self.MAX_INCOMPLETE_EVENT_SIZE,
+    """
+    return value.decode(errors="backslashreplace")
+
+
+# See https://datatracker.ietf.org/doc/html/rfc7230#appendix-B.
+
+# Regex for validating header names.
+
+_token_re = re.compile(rb"[-!#$%&\'*+.^_`|~0-9a-zA-Z]+")
+
+# Regex for validating header values.
+
+# We don't attempt to support obsolete line folding.
+
+# Include HTAB (\x09), SP (\x20), VCHAR (\x21-\x7e), obs-text (\x80-\xff).
+
+# The ABNF is complicated because it attempts to express that optional
+# whitespace is ignored. We strip whitespace and don't revalidate that.
+
+# See also https://www.rfc-editor.org/errata_search.php?rfc=7230&eid=4189
+
+_value_re = re.compile(rb"[\x09\x20-\x7e\x80-\xff]*")
+
+
+@dataclasses.dataclass
+class Request:
+    """
+    WebSocket handshake request.
+
+    Attributes:
+        path: Request path, including optional query.
+        headers: Request headers.
+    """
+
+    path: str
+    headers: Headers
+    # body isn't useful is the context of this library.
+
+    _exception: Exception | None = None
+
+    @property
+    def exception(self) -> Exception | None:  # pragma: no cover
+        warnings.warn(  # deprecated in 10.3 - 2022-04-17
+            "Request.exception is deprecated; use ServerProtocol.handshake_exc instead",
+            DeprecationWarning,
         )
+        return self._exception
 
-    async def handle_async_request(self, request: Request) -> Response:
-        if not self.can_handle_request(request.url.origin):
-            raise RuntimeError(
-                f"Attempted to send request to {request.url.origin} on connection "
-                f"to {self._origin}"
-            )
+    @classmethod
+    def parse(
+        cls,
+        read_line: Callable[[int], Generator[None, None, bytes]],
+    ) -> Generator[None, None, Request]:
+        """
+        Parse a WebSocket handshake request.
 
-        async with self._state_lock:
-            if self._state in (HTTPConnectionState.NEW, HTTPConnectionState.IDLE):
-                self._request_count += 1
-                self._state = HTTPConnectionState.ACTIVE
-                self._expire_at = None
-            else:
-                raise ConnectionNotAvailable()
+        This is a generator-based coroutine.
+
+        The request path isn't URL-decoded or validated in any way.
+
+        The request path and headers are expected to contain only ASCII
+        characters. Other characters are represented with surrogate escapes.
+
+        :meth:`parse` doesn't attempt to read the request body because
+        WebSocket handshake requests don't have one. If the request contains a
+        body, it may be read from the data stream after :meth:`parse` returns.
+
+        Args:
+            read_line: Generator-based coroutine that reads a LF-terminated
+                line or raises an exception if there isn't enough data
+
+        Raises:
+            EOFError: If the connection is closed without a full HTTP request.
+            SecurityError: If the request exceeds a security limit.
+            ValueError: If the request isn't well formatted.
+
+        """
+        # https://datatracker.ietf.org/doc/html/rfc7230#section-3.1.1
+
+        # Parsing is simple because fixed values are expected for method and
+        # version and because path isn't checked. Since WebSocket software tends
+        # to implement HTTP/1.1 strictly, there's little need for lenient parsing.
 
         try:
-            kwargs = {"request": request}
-            try:
-                async with Trace(
-                    "send_request_headers", logger, request, kwargs
-                ) as trace:
-                    await self._send_request_headers(**kwargs)
-                async with Trace("send_request_body", logger, request, kwargs) as trace:
-                    await self._send_request_body(**kwargs)
-            except WriteError:
-                # If we get a write error while we're writing the request,
-                # then we supress this error and move on to attempting to
-                # read the response. Servers can sometimes close the request
-                # pre-emptively and then respond with a well formed HTTP
-                # error response.
-                pass
+            request_line = yield from parse_line(read_line)
+        except EOFError as exc:
+            raise EOFError("connection closed while reading HTTP request line") from exc
 
-            async with Trace(
-                "receive_response_headers", logger, request, kwargs
-            ) as trace:
-                (
-                    http_version,
-                    status,
-                    reason_phrase,
-                    headers,
-                    trailing_data,
-                ) = await self._receive_response_headers(**kwargs)
-                trace.return_value = (
-                    http_version,
-                    status,
-                    reason_phrase,
-                    headers,
-                )
-
-            network_stream = self._network_stream
-
-            # CONNECT or Upgrade request
-            if (status == 101) or (
-                (request.method == b"CONNECT") and (200 <= status < 300)
-            ):
-                network_stream = AsyncHTTP11UpgradeStream(network_stream, trailing_data)
-
-            return Response(
-                status=status,
-                headers=headers,
-                content=HTTP11ConnectionByteStream(self, request),
-                extensions={
-                    "http_version": http_version,
-                    "reason_phrase": reason_phrase,
-                    "network_stream": network_stream,
-                },
-            )
-        except BaseException as exc:
-            with AsyncShieldCancellation():
-                async with Trace("response_closed", logger, request) as trace:
-                    await self._response_closed()
-            raise exc
-
-    # Sending the request...
-
-    async def _send_request_headers(self, request: Request) -> None:
-        timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("write", None)
-
-        with map_exceptions({h11.LocalProtocolError: LocalProtocolError}):
-            event = h11.Request(
-                method=request.method,
-                target=request.url.target,
-                headers=request.headers,
-            )
-        await self._send_event(event, timeout=timeout)
-
-    async def _send_request_body(self, request: Request) -> None:
-        timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("write", None)
-
-        assert isinstance(request.stream, typing.AsyncIterable)
-        async for chunk in request.stream:
-            event = h11.Data(data=chunk)
-            await self._send_event(event, timeout=timeout)
-
-        await self._send_event(h11.EndOfMessage(), timeout=timeout)
-
-    async def _send_event(self, event: h11.Event, timeout: float | None = None) -> None:
-        bytes_to_send = self._h11_state.send(event)
-        if bytes_to_send is not None:
-            await self._network_stream.write(bytes_to_send, timeout=timeout)
-
-    # Receiving the response...
-
-    async def _receive_response_headers(
-        self, request: Request
-    ) -> tuple[bytes, int, bytes, list[tuple[bytes, bytes]], bytes]:
-        timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("read", None)
-
-        while True:
-            event = await self._receive_event(timeout=timeout)
-            if isinstance(event, h11.Response):
-                break
-            if (
-                isinstance(event, h11.InformationalResponse)
-                and event.status_code == 101
-            ):
-                break
-
-        http_version = b"HTTP/" + event.http_version
-
-        # h11 version 0.11+ supports a `raw_items` interface to get the
-        # raw header casing, rather than the enforced lowercase headers.
-        headers = event.headers.raw_items()
-
-        trailing_data, _ = self._h11_state.trailing_data
-
-        return http_version, event.status_code, event.reason, headers, trailing_data
-
-    async def _receive_response_body(
-        self, request: Request
-    ) -> typing.AsyncIterator[bytes]:
-        timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("read", None)
-
-        while True:
-            event = await self._receive_event(timeout=timeout)
-            if isinstance(event, h11.Data):
-                yield bytes(event.data)
-            elif isinstance(event, (h11.EndOfMessage, h11.PAUSED)):
-                break
-
-    async def _receive_event(
-        self, timeout: float | None = None
-    ) -> h11.Event | type[h11.PAUSED]:
-        while True:
-            with map_exceptions({h11.RemoteProtocolError: RemoteProtocolError}):
-                event = self._h11_state.next_event()
-
-            if event is h11.NEED_DATA:
-                data = await self._network_stream.read(
-                    self.READ_NUM_BYTES, timeout=timeout
-                )
-
-                # If we feed this case through h11 we'll raise an exception like:
-                #
-                #     httpcore.RemoteProtocolError: can't handle event type
-                #     ConnectionClosed when role=SERVER and state=SEND_RESPONSE
-                #
-                # Which is accurate, but not very informative from an end-user
-                # perspective. Instead we handle this case distinctly and treat
-                # it as a ConnectError.
-                if data == b"" and self._h11_state.their_state == h11.SEND_RESPONSE:
-                    msg = "Server disconnected without sending a response."
-                    raise RemoteProtocolError(msg)
-
-                self._h11_state.receive_data(data)
-            else:
-                # mypy fails to narrow the type in the above if statement above
-                return event  # type: ignore[return-value]
-
-    async def _response_closed(self) -> None:
-        async with self._state_lock:
-            if (
-                self._h11_state.our_state is h11.DONE
-                and self._h11_state.their_state is h11.DONE
-            ):
-                self._state = HTTPConnectionState.IDLE
-                self._h11_state.start_next_cycle()
-                if self._keepalive_expiry is not None:
-                    now = time.monotonic()
-                    self._expire_at = now + self._keepalive_expiry
-            else:
-                await self.aclose()
-
-    # Once the connection is no longer required...
-
-    async def aclose(self) -> None:
-        # Note that this method unilaterally closes the connection, and does
-        # not have any kind of locking in place around it.
-        self._state = HTTPConnectionState.CLOSED
-        await self._network_stream.aclose()
-
-    # The AsyncConnectionInterface methods provide information about the state of
-    # the connection, allowing for a connection pooling implementation to
-    # determine when to reuse and when to close the connection...
-
-    def can_handle_request(self, origin: Origin) -> bool:
-        return origin == self._origin
-
-    def is_available(self) -> bool:
-        # Note that HTTP/1.1 connections in the "NEW" state are not treated as
-        # being "available". The control flow which created the connection will
-        # be able to send an outgoing request, but the connection will not be
-        # acquired from the connection pool for any other request.
-        return self._state == HTTPConnectionState.IDLE
-
-    def has_expired(self) -> bool:
-        now = time.monotonic()
-        keepalive_expired = self._expire_at is not None and now > self._expire_at
-
-        # If the HTTP connection is idle but the socket is readable, then the
-        # only valid state is that the socket is about to return b"", indicating
-        # a server-initiated disconnect.
-        server_disconnected = (
-            self._state == HTTPConnectionState.IDLE
-            and self._network_stream.get_extra_info("is_readable")
-        )
-
-        return keepalive_expired or server_disconnected
-
-    def is_idle(self) -> bool:
-        return self._state == HTTPConnectionState.IDLE
-
-    def is_closed(self) -> bool:
-        return self._state == HTTPConnectionState.CLOSED
-
-    def info(self) -> str:
-        origin = str(self._origin)
-        return (
-            f"{origin!r}, HTTP/1.1, {self._state.name}, "
-            f"Request Count: {self._request_count}"
-        )
-
-    def __repr__(self) -> str:
-        class_name = self.__class__.__name__
-        origin = str(self._origin)
-        return (
-            f"<{class_name} [{origin!r}, {self._state.name}, "
-            f"Request Count: {self._request_count}]>"
-        )
-
-    # These context managers are not used in the standard flow, but are
-    # useful for testing or working with connection instances directly.
-
-    async def __aenter__(self) -> AsyncHTTP11Connection:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None = None,
-        exc_value: BaseException | None = None,
-        traceback: types.TracebackType | None = None,
-    ) -> None:
-        await self.aclose()
-
-
-class HTTP11ConnectionByteStream:
-    def __init__(self, connection: AsyncHTTP11Connection, request: Request) -> None:
-        self._connection = connection
-        self._request = request
-        self._closed = False
-
-    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        kwargs = {"request": self._request}
         try:
-            async with Trace("receive_response_body", logger, self._request, kwargs):
-                async for chunk in self._connection._receive_response_body(**kwargs):
-                    yield chunk
-        except BaseException as exc:
-            # If we get an exception while streaming the response,
-            # we want to close the response (and possibly the connection)
-            # before raising that exception.
-            with AsyncShieldCancellation():
-                await self.aclose()
-            raise exc
+            method, raw_path, protocol = request_line.split(b" ", 2)
+        except ValueError:  # not enough values to unpack (expected 3, got 1-2)
+            raise ValueError(f"invalid HTTP request line: {d(request_line)}") from None
+        if protocol != b"HTTP/1.1":
+            raise ValueError(
+                f"unsupported protocol; expected HTTP/1.1: {d(request_line)}"
+            )
+        if method != b"GET":
+            raise ValueError(f"unsupported HTTP method; expected GET; got {d(method)}")
+        path = raw_path.decode("ascii", "surrogateescape")
 
-    async def aclose(self) -> None:
-        if not self._closed:
-            self._closed = True
-            async with Trace("response_closed", logger, self._request):
-                await self._connection._response_closed()
+        headers = yield from parse_headers(read_line)
+
+        # https://datatracker.ietf.org/doc/html/rfc7230#section-3.3.3
+
+        if "Transfer-Encoding" in headers:
+            raise NotImplementedError("transfer codings aren't supported")
+
+        if "Content-Length" in headers:
+            raise ValueError("unsupported request body")
+
+        return cls(path, headers)
+
+    def serialize(self) -> bytes:
+        """
+        Serialize a WebSocket handshake request.
+
+        """
+        # Since the request line and headers only contain ASCII characters,
+        # we can keep this simple.
+        request = f"GET {self.path} HTTP/1.1\r\n".encode()
+        request += self.headers.serialize()
+        return request
 
 
-class AsyncHTTP11UpgradeStream(AsyncNetworkStream):
-    def __init__(self, stream: AsyncNetworkStream, leading_data: bytes) -> None:
-        self._stream = stream
-        self._leading_data = leading_data
+@dataclasses.dataclass
+class Response:
+    """
+    WebSocket handshake response.
 
-    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
-        if self._leading_data:
-            buffer = self._leading_data[:max_bytes]
-            self._leading_data = self._leading_data[max_bytes:]
-            return buffer
+    Attributes:
+        status_code: Response code.
+        reason_phrase: Response reason.
+        headers: Response headers.
+        body: Response body.
+
+    """
+
+    status_code: int
+    reason_phrase: str
+    headers: Headers
+    body: bytes = b""
+
+    _exception: Exception | None = None
+
+    @property
+    def exception(self) -> Exception | None:  # pragma: no cover
+        warnings.warn(  # deprecated in 10.3 - 2022-04-17
+            "Response.exception is deprecated; "
+            "use ClientProtocol.handshake_exc instead",
+            DeprecationWarning,
+        )
+        return self._exception
+
+    @classmethod
+    def parse(
+        cls,
+        read_line: Callable[[int], Generator[None, None, bytes]],
+        read_exact: Callable[[int], Generator[None, None, bytes]],
+        read_to_eof: Callable[[int], Generator[None, None, bytes]],
+        include_body: bool = True,
+    ) -> Generator[None, None, Response]:
+        """
+        Parse a WebSocket handshake response.
+
+        This is a generator-based coroutine.
+
+        The reason phrase and headers are expected to contain only ASCII
+        characters. Other characters are represented with surrogate escapes.
+
+        Args:
+            read_line: Generator-based coroutine that reads a LF-terminated
+                line or raises an exception if there isn't enough data.
+            read_exact: Generator-based coroutine that reads the requested
+                bytes or raises an exception if there isn't enough data.
+            read_to_eof: Generator-based coroutine that reads until the end
+                of the stream.
+
+        Raises:
+            EOFError: If the connection is closed without a full HTTP response.
+            SecurityError: If the response exceeds a security limit.
+            LookupError: If the response isn't well formatted.
+            ValueError: If the response isn't well formatted.
+
+        """
+        # https://datatracker.ietf.org/doc/html/rfc7230#section-3.1.2
+
+        try:
+            status_line = yield from parse_line(read_line)
+        except EOFError as exc:
+            raise EOFError("connection closed while reading HTTP status line") from exc
+
+        try:
+            protocol, raw_status_code, raw_reason = status_line.split(b" ", 2)
+        except ValueError:  # not enough values to unpack (expected 3, got 1-2)
+            raise ValueError(f"invalid HTTP status line: {d(status_line)}") from None
+        if protocol != b"HTTP/1.1":
+            raise ValueError(
+                f"unsupported protocol; expected HTTP/1.1: {d(status_line)}"
+            )
+        try:
+            status_code = int(raw_status_code)
+        except ValueError:  # invalid literal for int() with base 10
+            raise ValueError(
+                f"invalid status code; expected integer; got {d(raw_status_code)}"
+            ) from None
+        if not 100 <= status_code < 600:
+            raise ValueError(
+                f"invalid status code; expected 100–599; got {d(raw_status_code)}"
+            )
+        if not _value_re.fullmatch(raw_reason):
+            raise ValueError(f"invalid HTTP reason phrase: {d(raw_reason)}")
+        reason = raw_reason.decode("ascii", "surrogateescape")
+
+        headers = yield from parse_headers(read_line)
+
+        if include_body:
+            body = yield from read_body(
+                status_code, headers, read_line, read_exact, read_to_eof
+            )
         else:
-            return await self._stream.read(max_bytes, timeout)
+            body = b""
 
-    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
-        await self._stream.write(buffer, timeout)
+        return cls(status_code, reason, headers, body)
 
-    async def aclose(self) -> None:
-        await self._stream.aclose()
+    def serialize(self) -> bytes:
+        """
+        Serialize a WebSocket handshake response.
 
-    async def start_tls(
-        self,
-        ssl_context: ssl.SSLContext,
-        server_hostname: str | None = None,
-        timeout: float | None = None,
-    ) -> AsyncNetworkStream:
-        return await self._stream.start_tls(ssl_context, server_hostname, timeout)
+        """
+        # Since the status line and headers only contain ASCII characters,
+        # we can keep this simple.
+        response = f"HTTP/1.1 {self.status_code} {self.reason_phrase}\r\n".encode()
+        response += self.headers.serialize()
+        response += self.body
+        return response
 
-    def get_extra_info(self, info: str) -> typing.Any:
-        return self._stream.get_extra_info(info)
+
+def parse_line(
+    read_line: Callable[[int], Generator[None, None, bytes]],
+) -> Generator[None, None, bytes]:
+    """
+    Parse a single line.
+
+    CRLF is stripped from the return value.
+
+    Args:
+        read_line: Generator-based coroutine that reads a LF-terminated line
+            or raises an exception if there isn't enough data.
+
+    Raises:
+        EOFError: If the connection is closed without a CRLF.
+        SecurityError: If the response exceeds a security limit.
+
+    """
+    try:
+        line = yield from read_line(MAX_LINE_LENGTH)
+    except RuntimeError:
+        raise SecurityError("line too long")
+    # Not mandatory but safe - https://datatracker.ietf.org/doc/html/rfc7230#section-3.5
+    if not line.endswith(b"\r\n"):
+        raise EOFError("line without CRLF")
+    return line[:-2]
+
+
+def parse_headers(
+    read_line: Callable[[int], Generator[None, None, bytes]],
+) -> Generator[None, None, Headers]:
+    """
+    Parse HTTP headers.
+
+    Non-ASCII characters are represented with surrogate escapes.
+
+    Args:
+        read_line: Generator-based coroutine that reads a LF-terminated line
+            or raises an exception if there isn't enough data.
+
+    Raises:
+        EOFError: If the connection is closed without complete headers.
+        SecurityError: If the request exceeds a security limit.
+        ValueError: If the request isn't well formatted.
+
+    """
+    # https://datatracker.ietf.org/doc/html/rfc7230#section-3.2
+
+    # We don't attempt to support obsolete line folding.
+
+    headers = Headers()
+    for _ in range(MAX_NUM_HEADERS + 1):
+        try:
+            line = yield from parse_line(read_line)
+        except EOFError as exc:
+            raise EOFError("connection closed while reading HTTP headers") from exc
+        if line == b"":
+            break
+
+        try:
+            raw_name, raw_value = line.split(b":", 1)
+        except ValueError:  # not enough values to unpack (expected 2, got 1)
+            raise ValueError(f"invalid HTTP header line: {d(line)}") from None
+        if not _token_re.fullmatch(raw_name):
+            raise ValueError(f"invalid HTTP header name: {d(raw_name)}")
+        raw_value = raw_value.strip(b" \t")
+        if not _value_re.fullmatch(raw_value):
+            raise ValueError(f"invalid HTTP header value: {d(raw_value)}")
+
+        name = raw_name.decode("ascii")  # guaranteed to be ASCII at this point
+        value = raw_value.decode("ascii", "surrogateescape")
+        headers[name] = value
+
+    else:
+        raise SecurityError("too many HTTP headers")
+
+    return headers
+
+
+def read_body(
+    status_code: int,
+    headers: Headers,
+    read_line: Callable[[int], Generator[None, None, bytes]],
+    read_exact: Callable[[int], Generator[None, None, bytes]],
+    read_to_eof: Callable[[int], Generator[None, None, bytes]],
+) -> Generator[None, None, bytes]:
+    # https://datatracker.ietf.org/doc/html/rfc7230#section-3.3.3
+
+    # Since websockets only does GET requests (no HEAD, no CONNECT), all
+    # responses except 1xx, 204, and 304 include a message body.
+    if 100 <= status_code < 200 or status_code == 204 or status_code == 304:
+        return b""
+
+    # MultipleValuesError is sufficiently unlikely that we don't attempt to
+    # handle it when accessing headers. Instead we document that its parent
+    # class, LookupError, may be raised.
+    # Conversions from str to int are protected by sys.set_int_max_str_digits..
+
+    elif (coding := headers.get("Transfer-Encoding")) is not None:
+        if coding != "chunked":
+            raise NotImplementedError(f"transfer coding {coding} isn't supported")
+
+        body = b""
+        while True:
+            chunk_size_line = yield from parse_line(read_line)
+            raw_chunk_size = chunk_size_line.split(b";", 1)[0]
+            # Set a lower limit than default_max_str_digits; 1 EB is plenty.
+            if len(raw_chunk_size) > 15:
+                str_chunk_size = raw_chunk_size.decode(errors="backslashreplace")
+                raise SecurityError(f"chunk too large: 0x{str_chunk_size} bytes")
+            chunk_size = int(raw_chunk_size, 16)
+            if chunk_size == 0:
+                break
+            if len(body) + chunk_size > MAX_BODY_SIZE:
+                raise SecurityError(
+                    f"chunk too large: {chunk_size} bytes after {len(body)} bytes"
+                )
+            body += yield from read_exact(chunk_size)
+            if (yield from read_exact(2)) != b"\r\n":
+                raise ValueError("chunk without CRLF")
+        # Read the trailer.
+        yield from parse_headers(read_line)
+        return body
+
+    elif (raw_content_length := headers.get("Content-Length")) is not None:
+        # Set a lower limit than default_max_str_digits; 1 EiB is plenty.
+        if len(raw_content_length) > 18:
+            raise SecurityError(f"body too large: {raw_content_length} bytes")
+        content_length = int(raw_content_length)
+        if content_length > MAX_BODY_SIZE:
+            raise SecurityError(f"body too large: {content_length} bytes")
+        return (yield from read_exact(content_length))
+
+    else:
+        try:
+            return (yield from read_to_eof(MAX_BODY_SIZE))
+        except RuntimeError:
+            raise SecurityError(f"body too large: over {MAX_BODY_SIZE} bytes")

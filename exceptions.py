@@ -1,335 +1,473 @@
+"""
+:mod:`websockets.exceptions` defines the following hierarchy of exceptions.
+
+* :exc:`WebSocketException`
+    * :exc:`ConnectionClosed`
+        * :exc:`ConnectionClosedOK`
+        * :exc:`ConnectionClosedError`
+    * :exc:`InvalidURI`
+    * :exc:`InvalidProxy`
+    * :exc:`InvalidHandshake`
+        * :exc:`SecurityError`
+        * :exc:`ProxyError`
+            * :exc:`InvalidProxyMessage`
+            * :exc:`InvalidProxyStatus`
+        * :exc:`InvalidMessage`
+        * :exc:`InvalidStatus`
+        * :exc:`InvalidStatusCode` (legacy)
+        * :exc:`InvalidHeader`
+            * :exc:`InvalidHeaderFormat`
+            * :exc:`InvalidHeaderValue`
+            * :exc:`InvalidOrigin`
+            * :exc:`InvalidUpgrade`
+        * :exc:`NegotiationError`
+            * :exc:`DuplicateParameter`
+            * :exc:`InvalidParameterName`
+            * :exc:`InvalidParameterValue`
+        * :exc:`AbortHandshake` (legacy)
+        * :exc:`RedirectHandshake` (legacy)
+    * :exc:`ProtocolError` (Sans-I/O)
+    * :exc:`PayloadTooBig` (Sans-I/O)
+    * :exc:`InvalidState` (Sans-I/O)
+    * :exc:`ConcurrencyError`
+
+"""
+
 from __future__ import annotations
 
-import socket
-import typing
 import warnings
-from email.errors import MessageDefect
-from http.client import IncompleteRead as httplib_IncompleteRead
 
-if typing.TYPE_CHECKING:
-    from .connection import HTTPConnection
-    from .connectionpool import ConnectionPool
-    from .response import HTTPResponse
-    from .util.retry import Retry
-
-# Base Exceptions
+from .imports import lazy_import
 
 
-class HTTPError(Exception):
-    """Base exception used by this module."""
+__all__ = [
+    "WebSocketException",
+    "ConnectionClosed",
+    "ConnectionClosedOK",
+    "ConnectionClosedError",
+    "InvalidURI",
+    "InvalidProxy",
+    "InvalidHandshake",
+    "SecurityError",
+    "ProxyError",
+    "InvalidProxyMessage",
+    "InvalidProxyStatus",
+    "InvalidMessage",
+    "InvalidStatus",
+    "InvalidHeader",
+    "InvalidHeaderFormat",
+    "InvalidHeaderValue",
+    "InvalidOrigin",
+    "InvalidUpgrade",
+    "NegotiationError",
+    "DuplicateParameter",
+    "InvalidParameterName",
+    "InvalidParameterValue",
+    "ProtocolError",
+    "PayloadTooBig",
+    "InvalidState",
+    "ConcurrencyError",
+]
 
 
-class HTTPWarning(Warning):
-    """Base warning used by this module."""
+class WebSocketException(Exception):
+    """
+    Base class for all exceptions defined by websockets.
+
+    """
 
 
-_TYPE_REDUCE_RESULT = tuple[typing.Callable[..., object], tuple[object, ...]]
+class ConnectionClosed(WebSocketException):
+    """
+    Raised when trying to interact with a closed connection.
 
-
-class PoolError(HTTPError):
-    """Base exception for errors caused within a pool."""
-
-    def __init__(self, pool: ConnectionPool, message: str) -> None:
-        self.pool = pool
-        self._message = message
-        super().__init__(f"{pool}: {message}")
-
-    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
-        # For pickling purposes.
-        return self.__class__, (None, self._message)
-
-
-class RequestError(PoolError):
-    """Base exception for PoolErrors that have associated URLs."""
-
-    def __init__(self, pool: ConnectionPool, url: str | None, message: str) -> None:
-        self.url = url
-        super().__init__(pool, message)
-
-    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
-        # For pickling purposes.
-        return self.__class__, (None, self.url, self._message)
-
-
-class SSLError(HTTPError):
-    """Raised when SSL certificate fails in an HTTPS connection."""
-
-
-class ProxyError(HTTPError):
-    """Raised when the connection to a proxy fails."""
-
-    # The original error is also available as __cause__.
-    original_error: Exception
-
-    def __init__(self, message: str, error: Exception) -> None:
-        super().__init__(message, error)
-        self.original_error = error
-
-
-class DecodeError(HTTPError):
-    """Raised when automatic decoding based on Content-Type fails."""
-
-
-class ProtocolError(HTTPError):
-    """Raised when something unexpected happens mid-request/response."""
-
-
-#: Renamed to ProtocolError but aliased for backwards compatibility.
-ConnectionError = ProtocolError
-
-
-# Leaf Exceptions
-
-
-class MaxRetryError(RequestError):
-    """Raised when the maximum number of retries is exceeded.
-
-    :param pool: The connection pool
-    :type pool: :class:`~urllib3.connectionpool.HTTPConnectionPool`
-    :param str url: The requested Url
-    :param reason: The underlying error
-    :type reason: :class:`Exception`
+    Attributes:
+        rcvd: If a close frame was received, its code and reason are available
+            in ``rcvd.code`` and ``rcvd.reason``.
+        sent: If a close frame was sent, its code and reason are available
+            in ``sent.code`` and ``sent.reason``.
+        rcvd_then_sent: If close frames were received and sent, this attribute
+            tells in which order this happened, from the perspective of this
+            side of the connection.
 
     """
 
     def __init__(
-        self, pool: ConnectionPool, url: str | None, reason: Exception | None = None
+        self,
+        rcvd: frames.Close | None,
+        sent: frames.Close | None,
+        rcvd_then_sent: bool | None = None,
     ) -> None:
-        self.reason = reason
+        self.rcvd = rcvd
+        self.sent = sent
+        self.rcvd_then_sent = rcvd_then_sent
+        assert (self.rcvd_then_sent is None) == (self.rcvd is None or self.sent is None)
 
-        message = f"Max retries exceeded with url: {url} (Caused by {reason!r})"
+    def __str__(self) -> str:
+        if self.rcvd is None:
+            if self.sent is None:
+                return "no close frame received or sent"
+            else:
+                return f"sent {self.sent}; no close frame received"
+        else:
+            if self.sent is None:
+                return f"received {self.rcvd}; no close frame sent"
+            else:
+                if self.rcvd_then_sent:
+                    return f"received {self.rcvd}; then sent {self.sent}"
+                else:
+                    return f"sent {self.sent}; then received {self.rcvd}"
 
-        super().__init__(pool, url, message)
-
-    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
-        # For pickling purposes.
-        return self.__class__, (None, self.url, self.reason)
-
-
-class HostChangedError(RequestError):
-    """Raised when an existing pool gets a request for a foreign host."""
-
-    def __init__(
-        self, pool: ConnectionPool, url: str, retries: Retry | int = 3
-    ) -> None:
-        message = f"Tried to open a foreign host with url: {url}"
-        super().__init__(pool, url, message)
-        self.retries = retries
-
-
-class TimeoutStateError(HTTPError):
-    """Raised when passing an invalid state to a timeout"""
-
-
-class TimeoutError(HTTPError):
-    """Raised when a socket timeout error occurs.
-
-    Catching this error will catch both :exc:`ReadTimeoutErrors
-    <ReadTimeoutError>` and :exc:`ConnectTimeoutErrors <ConnectTimeoutError>`.
-    """
-
-
-class ReadTimeoutError(TimeoutError, RequestError):
-    """Raised when a socket timeout occurs while receiving data from a server"""
-
-
-# This timeout error does not have a URL attached and needs to inherit from the
-# base HTTPError
-class ConnectTimeoutError(TimeoutError):
-    """Raised when a socket timeout occurs while connecting to a server"""
-
-
-class NewConnectionError(ConnectTimeoutError, HTTPError):
-    """Raised when we fail to establish a new connection. Usually ECONNREFUSED."""
-
-    def __init__(self, conn: HTTPConnection, message: str) -> None:
-        self.conn = conn
-        self._message = message
-        super().__init__(f"{conn}: {message}")
-
-    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
-        # For pickling purposes.
-        return self.__class__, (None, self._message)
+    # code and reason attributes are provided for backwards-compatibility
 
     @property
-    def pool(self) -> HTTPConnection:
-        warnings.warn(
-            "The 'pool' property is deprecated and will be removed "
-            "in urllib3 v3.0. Use 'conn' instead.",
-            FutureWarning,
-            stacklevel=2,
+    def code(self) -> int:
+        warnings.warn(  # deprecated in 13.1 - 2024-09-21
+            "ConnectionClosed.code is deprecated; "
+            "use Protocol.close_code or ConnectionClosed.rcvd.code",
+            DeprecationWarning,
         )
+        if self.rcvd is None:
+            return frames.CloseCode.ABNORMAL_CLOSURE
+        return self.rcvd.code
 
-        return self.conn
-
-
-class NameResolutionError(NewConnectionError):
-    """Raised when host name resolution fails."""
-
-    def __init__(self, host: str, conn: HTTPConnection, reason: socket.gaierror):
-        message = f"Failed to resolve '{host}' ({reason})"
-        self._host = host
-        self._reason = reason
-        super().__init__(conn, message)
-
-    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
-        # For pickling purposes.
-        return self.__class__, (self._host, None, self._reason)
-
-
-class EmptyPoolError(PoolError):
-    """Raised when a pool runs out of connections and no more are allowed."""
-
-
-class FullPoolError(PoolError):
-    """Raised when we try to add a connection to a full pool in blocking mode."""
-
-
-class ClosedPoolError(PoolError):
-    """Raised when a request enters a pool after the pool has been closed."""
-
-
-class LocationValueError(ValueError, HTTPError):
-    """Raised when there is something wrong with a given URL input."""
-
-
-class LocationParseError(LocationValueError):
-    """Raised when get_host or similar fails to parse the URL input."""
-
-    def __init__(self, location: str) -> None:
-        message = f"Failed to parse: {location}"
-        super().__init__(message)
-
-        self.location = location
-
-
-class URLSchemeUnknown(LocationValueError):
-    """Raised when a URL input has an unsupported scheme."""
-
-    def __init__(self, scheme: str):
-        message = f"Not supported URL scheme {scheme}"
-        super().__init__(message)
-
-        self.scheme = scheme
-
-
-class ResponseError(HTTPError):
-    """Used as a container for an error reason supplied in a MaxRetryError."""
-
-    GENERIC_ERROR = "too many error responses"
-    SPECIFIC_ERROR = "too many {status_code} error responses"
-
-
-class SecurityWarning(HTTPWarning):
-    """Warned when performing security reducing actions"""
-
-
-class InsecureRequestWarning(SecurityWarning):
-    """Warned when making an unverified HTTPS request."""
-
-
-class NotOpenSSLWarning(SecurityWarning):
-    """Warned when using unsupported SSL library"""
-
-
-class SystemTimeWarning(SecurityWarning):
-    """Warned when system time is suspected to be wrong"""
-
-
-class InsecurePlatformWarning(SecurityWarning):
-    """Warned when certain TLS/SSL configuration is not available on a platform."""
-
-
-class DependencyWarning(HTTPWarning):
-    """
-    Warned when an attempt is made to import a module with missing optional
-    dependencies.
-    """
-
-
-class ResponseNotChunked(ProtocolError, ValueError):
-    """Response needs to be chunked in order to read it as chunks."""
-
-
-class BodyNotHttplibCompatible(HTTPError):
-    """
-    Body should be :class:`http.client.HTTPResponse` like
-    (have an fp attribute which returns raw chunks) for read_chunked().
-    """
-
-
-class IncompleteRead(HTTPError, httplib_IncompleteRead):
-    """
-    Response length doesn't match expected Content-Length
-
-    Subclass of :class:`http.client.IncompleteRead` to allow int value
-    for ``partial`` to avoid creating large objects on streamed reads.
-    """
-
-    partial: int  # type: ignore[assignment]
-    expected: int
-
-    def __init__(self, partial: int, expected: int) -> None:
-        self.partial = partial
-        self.expected = expected
-
-    def __repr__(self) -> str:
-        return "IncompleteRead(%i bytes read, %i more expected)" % (
-            self.partial,
-            self.expected,
+    @property
+    def reason(self) -> str:
+        warnings.warn(  # deprecated in 13.1 - 2024-09-21
+            "ConnectionClosed.reason is deprecated; "
+            "use Protocol.close_reason or ConnectionClosed.rcvd.reason",
+            DeprecationWarning,
         )
+        if self.rcvd is None:
+            return ""
+        return self.rcvd.reason
 
 
-class InvalidChunkLength(HTTPError, httplib_IncompleteRead):
-    """Invalid chunk length in a chunked response."""
+class ConnectionClosedOK(ConnectionClosed):
+    """
+    Like :exc:`ConnectionClosed`, when the connection terminated properly.
 
-    def __init__(self, response: HTTPResponse, length: bytes) -> None:
-        self.partial: int = response.tell()  # type: ignore[assignment]
-        self.expected: int | None = response.length_remaining
+    A close code with code 1000 (OK) or 1001 (going away) or without a code was
+    received and sent.
+
+    """
+
+
+class ConnectionClosedError(ConnectionClosed):
+    """
+    Like :exc:`ConnectionClosed`, when the connection terminated with an error.
+
+    A close frame with a code other than 1000 (OK) or 1001 (going away) was
+    received or sent, or the closing handshake didn't complete properly.
+
+    """
+
+
+class InvalidURI(WebSocketException):
+    """
+    Raised when connecting to a URI that isn't a valid WebSocket URI.
+
+    """
+
+    def __init__(self, uri: str, msg: str) -> None:
+        self.uri = uri
+        self.msg = msg
+
+    def __str__(self) -> str:
+        return f"{self.uri} isn't a valid URI: {self.msg}"
+
+
+class InvalidProxy(WebSocketException):
+    """
+    Raised when connecting via a proxy that isn't valid.
+
+    """
+
+    def __init__(self, proxy: str, msg: str) -> None:
+        self.proxy = proxy
+        self.msg = msg
+
+    def __str__(self) -> str:
+        return f"{self.proxy} isn't a valid proxy: {self.msg}"
+
+
+class InvalidHandshake(WebSocketException):
+    """
+    Base class for exceptions raised when the opening handshake fails.
+
+    """
+
+
+class SecurityError(InvalidHandshake):
+    """
+    Raised when a handshake request or response breaks a security rule.
+
+    Security limits can be configured with :doc:`environment variables
+    <../reference/variables>`.
+
+    """
+
+
+class ProxyError(InvalidHandshake):
+    """
+    Raised when failing to connect to a proxy.
+
+    """
+
+
+class InvalidProxyMessage(ProxyError):
+    """
+    Raised when an HTTP proxy response is malformed.
+
+    """
+
+
+class InvalidProxyStatus(ProxyError):
+    """
+    Raised when an HTTP proxy rejects the connection.
+
+    """
+
+    def __init__(self, response: http11.Response) -> None:
         self.response = response
-        self.length = length
 
-    def __repr__(self) -> str:
-        return "InvalidChunkLength(got length %r, %i bytes read)" % (
-            self.length,
-            self.partial,
+    def __str__(self) -> str:
+        return f"proxy rejected connection: HTTP {self.response.status_code:d}"
+
+
+class InvalidMessage(InvalidHandshake):
+    """
+    Raised when a handshake request or response is malformed.
+
+    """
+
+
+class InvalidStatus(InvalidHandshake):
+    """
+    Raised when a handshake response rejects the WebSocket upgrade.
+
+    """
+
+    def __init__(self, response: http11.Response) -> None:
+        self.response = response
+
+    def __str__(self) -> str:
+        return (
+            f"server rejected WebSocket connection: HTTP {self.response.status_code:d}"
         )
 
 
-class InvalidHeader(HTTPError):
-    """The header provided was somehow invalid."""
+class InvalidHeader(InvalidHandshake):
+    """
+    Raised when an HTTP header doesn't have a valid format or value.
 
+    """
 
-class ProxySchemeUnknown(AssertionError, URLSchemeUnknown):
-    """ProxyManager does not support the supplied scheme"""
+    def __init__(self, name: str, value: str | None = None) -> None:
+        self.name = name
+        self.value = value
 
-    # TODO(t-8ch): Stop inheriting from AssertionError in v2.0.
-
-    def __init__(self, scheme: str | None) -> None:
-        # 'localhost' is here because our URL parser parses
-        # localhost:8080 -> scheme=localhost, remove if we fix this.
-        if scheme == "localhost":
-            scheme = None
-        if scheme is None:
-            message = "Proxy URL had no scheme, should start with http:// or https://"
+    def __str__(self) -> str:
+        if self.value is None:
+            return f"missing {self.name} header"
+        elif self.value == "":
+            return f"empty {self.name} header"
         else:
-            message = f"Proxy URL had unsupported scheme {scheme}, should use http:// or https://"
-        super().__init__(message)
+            return f"invalid {self.name} header: {self.value}"
 
 
-class ProxySchemeUnsupported(ValueError):
-    """Fetching HTTPS resources through HTTPS proxies is unsupported"""
+class InvalidHeaderFormat(InvalidHeader):
+    """
+    Raised when an HTTP header cannot be parsed.
+
+    The format of the header doesn't match the grammar for that header.
+
+    """
+
+    def __init__(self, name: str, error: str, header: str, pos: int) -> None:
+        super().__init__(name, f"{error} at {pos} in {header}")
 
 
-class HeaderParsingError(HTTPError):
-    """Raised by assert_header_parsing, but we convert it to a log.warning statement."""
+class InvalidHeaderValue(InvalidHeader):
+    """
+    Raised when an HTTP header has a wrong value.
+
+    The format of the header is correct but the value isn't acceptable.
+
+    """
+
+
+class InvalidOrigin(InvalidHeader):
+    """
+    Raised when the Origin header in a request isn't allowed.
+
+    """
+
+    def __init__(self, origin: str | None) -> None:
+        super().__init__("Origin", origin)
+
+
+class InvalidUpgrade(InvalidHeader):
+    """
+    Raised when the Upgrade or Connection header isn't correct.
+
+    """
+
+
+class NegotiationError(InvalidHandshake):
+    """
+    Raised when negotiating an extension or a subprotocol fails.
+
+    """
+
+
+class DuplicateParameter(NegotiationError):
+    """
+    Raised when a parameter name is repeated in an extension header.
+
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __str__(self) -> str:
+        return f"duplicate parameter: {self.name}"
+
+
+class InvalidParameterName(NegotiationError):
+    """
+    Raised when a parameter name in an extension header is invalid.
+
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __str__(self) -> str:
+        return f"invalid parameter name: {self.name}"
+
+
+class InvalidParameterValue(NegotiationError):
+    """
+    Raised when a parameter value in an extension header is invalid.
+
+    """
+
+    def __init__(self, name: str, value: str | None) -> None:
+        self.name = name
+        self.value = value
+
+    def __str__(self) -> str:
+        if self.value is None:
+            return f"missing value for parameter {self.name}"
+        elif self.value == "":
+            return f"empty value for parameter {self.name}"
+        else:
+            return f"invalid value for parameter {self.name}: {self.value}"
+
+
+class ProtocolError(WebSocketException):
+    """
+    Raised when receiving or sending a frame that breaks the protocol.
+
+    The Sans-I/O implementation raises this exception when:
+
+    * receiving or sending a frame that contains invalid data;
+    * receiving or sending an invalid sequence of frames.
+
+    """
+
+
+class PayloadTooBig(WebSocketException):
+    """
+    Raised when parsing a frame with a payload that exceeds the maximum size.
+
+    The Sans-I/O layer uses this exception internally. It doesn't bubble up to
+    the I/O layer.
+
+    The :meth:`~websockets.extensions.Extension.decode` method of extensions
+    must raise :exc:`PayloadTooBig` if decoding a frame would exceed the limit.
+
+    """
 
     def __init__(
-        self, defects: list[MessageDefect], unparsed_data: bytes | str | None
+        self,
+        size_or_message: int | None | str,
+        max_size: int | None = None,
+        cur_size: int | None = None,
     ) -> None:
-        message = f"{defects or 'Unknown'}, unparsed data: {unparsed_data!r}"
-        super().__init__(message)
+        if isinstance(size_or_message, str):
+            assert max_size is None
+            assert cur_size is None
+            warnings.warn(  # deprecated in 14.0 - 2024-11-09
+                "PayloadTooBig(message) is deprecated; "
+                "change to PayloadTooBig(size, max_size)",
+                DeprecationWarning,
+            )
+            self.message: str | None = size_or_message
+        else:
+            self.message = None
+            self.size: int | None = size_or_message
+            assert max_size is not None
+            self.max_size: int = max_size
+            self.cur_size: int | None = None
+            self.set_current_size(cur_size)
+
+    def __str__(self) -> str:
+        if self.message is not None:
+            return self.message
+        else:
+            message = "frame "
+            if self.size is not None:
+                message += f"with {self.size} bytes "
+            if self.cur_size is not None:
+                message += f"after reading {self.cur_size} bytes "
+            message += f"exceeds limit of {self.max_size} bytes"
+            return message
+
+    def set_current_size(self, cur_size: int | None) -> None:
+        assert self.cur_size is None
+        if cur_size is not None:
+            self.max_size += cur_size
+            self.cur_size = cur_size
 
 
-class UnrewindableBodyError(HTTPError):
-    """urllib3 encountered an error when trying to rewind a body"""
+class InvalidState(WebSocketException, AssertionError):
+    """
+    Raised when sending a frame is forbidden in the current state.
+
+    Specifically, the Sans-I/O layer raises this exception when:
+
+    * sending a data frame to a connection in a state other
+      :attr:`~websockets.protocol.State.OPEN`;
+    * sending a control frame to a connection in a state other than
+      :attr:`~websockets.protocol.State.OPEN` or
+      :attr:`~websockets.protocol.State.CLOSING`.
+
+    """
+
+
+class ConcurrencyError(WebSocketException, RuntimeError):
+    """
+    Raised when receiving or sending messages concurrently.
+
+    WebSocket is a connection-oriented protocol. Reads must be serialized; so
+    must be writes. However, reading and writing concurrently is possible.
+
+    """
+
+
+# At the bottom to break import cycles created by type annotations.
+from . import frames, http11  # noqa: E402
+
+
+lazy_import(
+    globals(),
+    deprecated_aliases={
+        # deprecated in 14.0 - 2024-11-09
+        "AbortHandshake": ".legacy.exceptions",
+        "InvalidStatusCode": ".legacy.exceptions",
+        "RedirectHandshake": ".legacy.exceptions",
+        "WebSocketProtocolError": ".legacy.exceptions",
+    },
+)

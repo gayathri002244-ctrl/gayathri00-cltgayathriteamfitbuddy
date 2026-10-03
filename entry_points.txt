@@ -1,2 +1,2 @@
 [console_scripts]
-uvicorn = uvicorn.main:main
+watchfiles=watchfiles.cli:cli
