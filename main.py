@@ -1,621 +1,374 @@
-from __future__ import annotations as _annotations
+import logging
+import os
+import sys
+import warnings
+from collections.abc import AsyncGenerator, Callable, Generator
+from enum import IntEnum
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-import asyncio
-import inspect
-import threading
-from argparse import Namespace
-from collections.abc import Mapping
-from types import SimpleNamespace
-from typing import Any, ClassVar, TypeVar
+import anyio
 
-from pydantic import ConfigDict
-from pydantic._internal._config import config_keys
-from pydantic._internal._signature import _field_name_for_signature
-from pydantic._internal._utils import deep_update, is_model_class
-from pydantic.dataclasses import is_pydantic_dataclass
-from pydantic.main import BaseModel
+from ._rust_notify import RustNotify
+from .filters import DefaultFilter
 
-from .exceptions import SettingsError
-from .sources import (
-    ENV_FILE_SENTINEL,
-    CliSettingsSource,
-    DefaultSettingsSource,
-    DotEnvSettingsSource,
-    DotenvType,
-    EnvSettingsSource,
-    InitSettingsSource,
-    PathType,
-    PydanticBaseSettingsSource,
-    PydanticModel,
-    SecretsSettingsSource,
-    get_subcommand,
-)
-
-T = TypeVar('T')
+__all__ = 'watch', 'awatch', 'Change', 'FileChange'
+logger = logging.getLogger('watchfiles.main')
 
 
-class SettingsConfigDict(ConfigDict, total=False):
-    case_sensitive: bool
-    nested_model_default_partial_update: bool | None
-    env_prefix: str
-    env_file: DotenvType | None
-    env_file_encoding: str | None
-    env_ignore_empty: bool
-    env_nested_delimiter: str | None
-    env_nested_max_split: int | None
-    env_parse_none_str: str | None
-    env_parse_enums: bool | None
-    cli_prog_name: str | None
-    cli_parse_args: bool | list[str] | tuple[str, ...] | None
-    cli_parse_none_str: str | None
-    cli_hide_none_type: bool
-    cli_avoid_json: bool
-    cli_enforce_required: bool
-    cli_use_class_docs_for_groups: bool
-    cli_exit_on_error: bool
-    cli_prefix: str
-    cli_flag_prefix_char: str
-    cli_implicit_flags: bool | None
-    cli_ignore_unknown_args: bool | None
-    cli_kebab_case: bool | None
-    cli_shortcuts: Mapping[str, str | list[str]] | None
-    secrets_dir: PathType | None
-    json_file: PathType | None
-    json_file_encoding: str | None
-    yaml_file: PathType | None
-    yaml_file_encoding: str | None
-    yaml_config_section: str | None
+class Change(IntEnum):
     """
-    Specifies the top-level key in a YAML file from which to load the settings.
-    If provided, the settings will be loaded from the nested section under this key.
-    This is useful when the YAML file contains multiple configuration sections
-    and you only want to load a specific subset into your settings model.
+    Enum representing the type of change that occurred.
     """
 
-    pyproject_toml_depth: int
+    added = 1
+    """A new file or directory was added."""
+    modified = 2
+    """A file or directory was modified, can be either a metadata or data change."""
+    deleted = 3
+    """A file or directory was deleted."""
+
+    def raw_str(self) -> str:
+        return self.name
+
+
+FileChange = tuple[Change, str]
+"""
+A tuple representing a file change, first element is a [`Change`][watchfiles.Change] member, second is the path
+of the file or directory that changed.
+"""
+
+if TYPE_CHECKING:
+    import asyncio
+    from typing import Protocol
+
+    import trio
+
+    AnyEvent = anyio.Event | asyncio.Event | trio.Event
+
+    class AbstractEvent(Protocol):
+        def is_set(self) -> bool: ...
+
+
+def watch(
+    *paths: Path | str,
+    watch_filter: Callable[['Change', str], bool] | None = DefaultFilter(),
+    debounce: int = 1_600,
+    step: int = 50,
+    stop_event: 'AbstractEvent | None' = None,
+    rust_timeout: int = 5_000,
+    yield_on_timeout: bool = False,
+    debug: bool | None = None,
+    raise_interrupt: bool = True,
+    force_polling: bool | None = None,
+    poll_delay_ms: int = 300,
+    recursive: bool = True,
+    ignore_permission_denied: bool | None = None,
+) -> Generator[set[FileChange], None, None]:
     """
-    Number of levels **up** from the current working directory to attempt to find a pyproject.toml
-    file.
+    Watch one or more paths and yield a set of changes whenever files change.
 
-    This is only used when a pyproject.toml file is not found in the current working directory.
-    """
+    The paths watched can be directories or files, directories are watched recursively - changes in subdirectories
+    are also detected.
 
-    pyproject_toml_table_header: tuple[str, ...]
-    """
-    Header of the TOML table within a pyproject.toml file to use when filling variables.
-    This is supplied as a `tuple[str, ...]` instead of a `str` to accommodate for headers
-    containing a `.`.
+    #### Force polling
 
-    For example, `toml_table_header = ("tool", "my.tool", "foo")` can be used to fill variable
-    values from a table with header `[tool."my.tool".foo]`.
+    Notify will fall back to file polling if it can't use file system notifications, but we also force Notify
+    to use polling if the `force_polling` argument is `True`; if `force_polling` is unset (or `None`), we enable
+    force polling thus:
 
-    To use the root table, exclude this config setting or provide an empty tuple.
-    """
+    * if the `WATCHFILES_FORCE_POLLING` environment variable exists and is not empty:
+        * if the value is `false`, `disable` or `disabled`, force polling is disabled
+        * otherwise, force polling is enabled
+    * otherwise, we enable force polling only if we detect we're running on WSL (Windows Subsystem for Linux)
 
-    toml_file: PathType | None
-    enable_decoding: bool
+    It is also possible to change the poll delay between iterations, it can be changed to maintain a good response time
+    and an appropiate CPU consumption using the `poll_delay_ms` argument, we change poll delay thus:
 
-
-# Extend `config_keys` by pydantic settings config keys to
-# support setting config through class kwargs.
-# Pydantic uses `config_keys` in `pydantic._internal._config.ConfigWrapper.for_model`
-# to extract config keys from model kwargs, So, by adding pydantic settings keys to
-# `config_keys`, they will be considered as valid config keys and will be collected
-# by Pydantic.
-config_keys |= set(SettingsConfigDict.__annotations__.keys())
-
-
-class BaseSettings(BaseModel):
-    """
-    Base class for settings, allowing values to be overridden by environment variables.
-
-    This is useful in production for secrets you do not wish to save in code, it plays nicely with docker(-compose),
-    Heroku and any 12 factor app design.
-
-    All the below attributes can be set via `model_config`.
+    * if file polling is enabled and the `WATCHFILES_POLL_DELAY_MS` env var exists and it is numeric, we use that
+    * otherwise, we use the argument value
 
     Args:
-        _case_sensitive: Whether environment and CLI variable names should be read with case-sensitivity.
-            Defaults to `None`.
-        _nested_model_default_partial_update: Whether to allow partial updates on nested model default object fields.
-            Defaults to `False`.
-        _env_prefix: Prefix for all environment variables. Defaults to `None`.
-        _env_file: The env file(s) to load settings values from. Defaults to `Path('')`, which
-            means that the value from `model_config['env_file']` should be used. You can also pass
-            `None` to indicate that environment variables should not be loaded from an env file.
-        _env_file_encoding: The env file encoding, e.g. `'latin-1'`. Defaults to `None`.
-        _env_ignore_empty: Ignore environment variables where the value is an empty string. Default to `False`.
-        _env_nested_delimiter: The nested env values delimiter. Defaults to `None`.
-        _env_nested_max_split: The nested env values maximum nesting. Defaults to `None`, which means no limit.
-        _env_parse_none_str: The env string value that should be parsed (e.g. "null", "void", "None", etc.)
-            into `None` type(None). Defaults to `None` type(None), which means no parsing should occur.
-        _env_parse_enums: Parse enum field names to values. Defaults to `None.`, which means no parsing should occur.
-        _cli_prog_name: The CLI program name to display in help text. Defaults to `None` if _cli_parse_args is `None`.
-            Otherwise, defaults to sys.argv[0].
-        _cli_parse_args: The list of CLI arguments to parse. Defaults to None.
-            If set to `True`, defaults to sys.argv[1:].
-        _cli_settings_source: Override the default CLI settings source with a user defined instance. Defaults to None.
-        _cli_parse_none_str: The CLI string value that should be parsed (e.g. "null", "void", "None", etc.) into
-            `None` type(None). Defaults to _env_parse_none_str value if set. Otherwise, defaults to "null" if
-            _cli_avoid_json is `False`, and "None" if _cli_avoid_json is `True`.
-        _cli_hide_none_type: Hide `None` values in CLI help text. Defaults to `False`.
-        _cli_avoid_json: Avoid complex JSON objects in CLI help text. Defaults to `False`.
-        _cli_enforce_required: Enforce required fields at the CLI. Defaults to `False`.
-        _cli_use_class_docs_for_groups: Use class docstrings in CLI group help text instead of field descriptions.
-            Defaults to `False`.
-        _cli_exit_on_error: Determines whether or not the internal parser exits with error info when an error occurs.
-            Defaults to `True`.
-        _cli_prefix: The root parser command line arguments prefix. Defaults to "".
-        _cli_flag_prefix_char: The flag prefix character to use for CLI optional arguments. Defaults to '-'.
-        _cli_implicit_flags: Whether `bool` fields should be implicitly converted into CLI boolean flags.
-            (e.g. --flag, --no-flag). Defaults to `False`.
-        _cli_ignore_unknown_args: Whether to ignore unknown CLI args and parse only known ones. Defaults to `False`.
-        _cli_kebab_case: CLI args use kebab case. Defaults to `False`.
-        _cli_shortcuts: Mapping of target field name to alias names. Defaults to `None`.
-        _secrets_dir: The secret files directory or a sequence of directories. Defaults to `None`.
+        *paths: filesystem paths to watch.
+        watch_filter: callable used to filter out changes which are not important, you can either use a raw callable
+            or a [`BaseFilter`][watchfiles.BaseFilter] instance,
+            defaults to an instance of [`DefaultFilter`][watchfiles.DefaultFilter]. To keep all changes, use `None`.
+        debounce: maximum time in milliseconds to group changes over before yielding them.
+        step: time to wait for new changes in milliseconds, if no changes are detected in this time, and
+            at least one change has been detected, the changes are yielded.
+        stop_event: event to stop watching, if this is set, the generator will stop iteration,
+            this can be anything with an `is_set()` method which returns a bool, e.g. `threading.Event()`.
+        rust_timeout: maximum time in milliseconds to wait in the rust code for changes, `0` means no timeout.
+        yield_on_timeout: if `True`, the generator will yield upon timeout in rust even if no changes are detected.
+        debug: whether to print information about all filesystem changes in rust to stdout, if `None` will use the
+            `WATCHFILES_DEBUG` environment variable.
+        raise_interrupt: whether to re-raise `KeyboardInterrupt`s, or suppress the error and just stop iterating.
+        force_polling: See [Force polling](#force-polling) above.
+        poll_delay_ms: delay between polling for changes, only used if `force_polling=True`.
+        recursive: if `True`, watch for changes in sub-directories recursively, otherwise watch only for changes in the
+            top-level directory, default is `True`.
+        ignore_permission_denied: if `True`, will ignore permission denied errors, otherwise will raise them by default.
+            Setting the `WATCHFILES_IGNORE_PERMISSION_DENIED` environment variable will set this value too.
+
+    Yields:
+        The generator yields sets of [`FileChange`][watchfiles.main.FileChange]s.
+
+    ```py title="Example of watch usage"
+    from watchfiles import watch
+
+    for changes in watch('./first/dir', './second/dir', raise_interrupt=False):
+        print(changes)
+    ```
     """
-
-    def __init__(
-        __pydantic_self__,
-        _case_sensitive: bool | None = None,
-        _nested_model_default_partial_update: bool | None = None,
-        _env_prefix: str | None = None,
-        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
-        _env_file_encoding: str | None = None,
-        _env_ignore_empty: bool | None = None,
-        _env_nested_delimiter: str | None = None,
-        _env_nested_max_split: int | None = None,
-        _env_parse_none_str: str | None = None,
-        _env_parse_enums: bool | None = None,
-        _cli_prog_name: str | None = None,
-        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
-        _cli_settings_source: CliSettingsSource[Any] | None = None,
-        _cli_parse_none_str: str | None = None,
-        _cli_hide_none_type: bool | None = None,
-        _cli_avoid_json: bool | None = None,
-        _cli_enforce_required: bool | None = None,
-        _cli_use_class_docs_for_groups: bool | None = None,
-        _cli_exit_on_error: bool | None = None,
-        _cli_prefix: str | None = None,
-        _cli_flag_prefix_char: str | None = None,
-        _cli_implicit_flags: bool | None = None,
-        _cli_ignore_unknown_args: bool | None = None,
-        _cli_kebab_case: bool | None = None,
-        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
-        _secrets_dir: PathType | None = None,
-        **values: Any,
-    ) -> None:
-        super().__init__(
-            **__pydantic_self__._settings_build_values(
-                values,
-                _case_sensitive=_case_sensitive,
-                _nested_model_default_partial_update=_nested_model_default_partial_update,
-                _env_prefix=_env_prefix,
-                _env_file=_env_file,
-                _env_file_encoding=_env_file_encoding,
-                _env_ignore_empty=_env_ignore_empty,
-                _env_nested_delimiter=_env_nested_delimiter,
-                _env_nested_max_split=_env_nested_max_split,
-                _env_parse_none_str=_env_parse_none_str,
-                _env_parse_enums=_env_parse_enums,
-                _cli_prog_name=_cli_prog_name,
-                _cli_parse_args=_cli_parse_args,
-                _cli_settings_source=_cli_settings_source,
-                _cli_parse_none_str=_cli_parse_none_str,
-                _cli_hide_none_type=_cli_hide_none_type,
-                _cli_avoid_json=_cli_avoid_json,
-                _cli_enforce_required=_cli_enforce_required,
-                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
-                _cli_exit_on_error=_cli_exit_on_error,
-                _cli_prefix=_cli_prefix,
-                _cli_flag_prefix_char=_cli_flag_prefix_char,
-                _cli_implicit_flags=_cli_implicit_flags,
-                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
-                _cli_kebab_case=_cli_kebab_case,
-                _cli_shortcuts=_cli_shortcuts,
-                _secrets_dir=_secrets_dir,
-            )
-        )
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """
-        Define the sources and their order for loading the settings values.
-
-        Args:
-            settings_cls: The Settings class.
-            init_settings: The `InitSettingsSource` instance.
-            env_settings: The `EnvSettingsSource` instance.
-            dotenv_settings: The `DotEnvSettingsSource` instance.
-            file_secret_settings: The `SecretsSettingsSource` instance.
-
-        Returns:
-            A tuple containing the sources and their order for loading the settings values.
-        """
-        return init_settings, env_settings, dotenv_settings, file_secret_settings
-
-    def _settings_build_values(
-        self,
-        init_kwargs: dict[str, Any],
-        _case_sensitive: bool | None = None,
-        _nested_model_default_partial_update: bool | None = None,
-        _env_prefix: str | None = None,
-        _env_file: DotenvType | None = None,
-        _env_file_encoding: str | None = None,
-        _env_ignore_empty: bool | None = None,
-        _env_nested_delimiter: str | None = None,
-        _env_nested_max_split: int | None = None,
-        _env_parse_none_str: str | None = None,
-        _env_parse_enums: bool | None = None,
-        _cli_prog_name: str | None = None,
-        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
-        _cli_settings_source: CliSettingsSource[Any] | None = None,
-        _cli_parse_none_str: str | None = None,
-        _cli_hide_none_type: bool | None = None,
-        _cli_avoid_json: bool | None = None,
-        _cli_enforce_required: bool | None = None,
-        _cli_use_class_docs_for_groups: bool | None = None,
-        _cli_exit_on_error: bool | None = None,
-        _cli_prefix: str | None = None,
-        _cli_flag_prefix_char: str | None = None,
-        _cli_implicit_flags: bool | None = None,
-        _cli_ignore_unknown_args: bool | None = None,
-        _cli_kebab_case: bool | None = None,
-        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
-        _secrets_dir: PathType | None = None,
-    ) -> dict[str, Any]:
-        # Determine settings config values
-        case_sensitive = _case_sensitive if _case_sensitive is not None else self.model_config.get('case_sensitive')
-        env_prefix = _env_prefix if _env_prefix is not None else self.model_config.get('env_prefix')
-        nested_model_default_partial_update = (
-            _nested_model_default_partial_update
-            if _nested_model_default_partial_update is not None
-            else self.model_config.get('nested_model_default_partial_update')
-        )
-        env_file = _env_file if _env_file != ENV_FILE_SENTINEL else self.model_config.get('env_file')
-        env_file_encoding = (
-            _env_file_encoding if _env_file_encoding is not None else self.model_config.get('env_file_encoding')
-        )
-        env_ignore_empty = (
-            _env_ignore_empty if _env_ignore_empty is not None else self.model_config.get('env_ignore_empty')
-        )
-        env_nested_delimiter = (
-            _env_nested_delimiter
-            if _env_nested_delimiter is not None
-            else self.model_config.get('env_nested_delimiter')
-        )
-        env_nested_max_split = (
-            _env_nested_max_split
-            if _env_nested_max_split is not None
-            else self.model_config.get('env_nested_max_split')
-        )
-        env_parse_none_str = (
-            _env_parse_none_str if _env_parse_none_str is not None else self.model_config.get('env_parse_none_str')
-        )
-        env_parse_enums = _env_parse_enums if _env_parse_enums is not None else self.model_config.get('env_parse_enums')
-
-        cli_prog_name = _cli_prog_name if _cli_prog_name is not None else self.model_config.get('cli_prog_name')
-        cli_parse_args = _cli_parse_args if _cli_parse_args is not None else self.model_config.get('cli_parse_args')
-        cli_settings_source = (
-            _cli_settings_source if _cli_settings_source is not None else self.model_config.get('cli_settings_source')
-        )
-        cli_parse_none_str = (
-            _cli_parse_none_str if _cli_parse_none_str is not None else self.model_config.get('cli_parse_none_str')
-        )
-        cli_parse_none_str = cli_parse_none_str if not env_parse_none_str else env_parse_none_str
-        cli_hide_none_type = (
-            _cli_hide_none_type if _cli_hide_none_type is not None else self.model_config.get('cli_hide_none_type')
-        )
-        cli_avoid_json = _cli_avoid_json if _cli_avoid_json is not None else self.model_config.get('cli_avoid_json')
-        cli_enforce_required = (
-            _cli_enforce_required
-            if _cli_enforce_required is not None
-            else self.model_config.get('cli_enforce_required')
-        )
-        cli_use_class_docs_for_groups = (
-            _cli_use_class_docs_for_groups
-            if _cli_use_class_docs_for_groups is not None
-            else self.model_config.get('cli_use_class_docs_for_groups')
-        )
-        cli_exit_on_error = (
-            _cli_exit_on_error if _cli_exit_on_error is not None else self.model_config.get('cli_exit_on_error')
-        )
-        cli_prefix = _cli_prefix if _cli_prefix is not None else self.model_config.get('cli_prefix')
-        cli_flag_prefix_char = (
-            _cli_flag_prefix_char
-            if _cli_flag_prefix_char is not None
-            else self.model_config.get('cli_flag_prefix_char')
-        )
-        cli_implicit_flags = (
-            _cli_implicit_flags if _cli_implicit_flags is not None else self.model_config.get('cli_implicit_flags')
-        )
-        cli_ignore_unknown_args = (
-            _cli_ignore_unknown_args
-            if _cli_ignore_unknown_args is not None
-            else self.model_config.get('cli_ignore_unknown_args')
-        )
-        cli_kebab_case = _cli_kebab_case if _cli_kebab_case is not None else self.model_config.get('cli_kebab_case')
-        cli_shortcuts = _cli_shortcuts if _cli_shortcuts is not None else self.model_config.get('cli_shortcuts')
-
-        secrets_dir = _secrets_dir if _secrets_dir is not None else self.model_config.get('secrets_dir')
-
-        # Configure built-in sources
-        default_settings = DefaultSettingsSource(
-            self.__class__, nested_model_default_partial_update=nested_model_default_partial_update
-        )
-        init_settings = InitSettingsSource(
-            self.__class__,
-            init_kwargs=init_kwargs,
-            nested_model_default_partial_update=nested_model_default_partial_update,
-        )
-        env_settings = EnvSettingsSource(
-            self.__class__,
-            case_sensitive=case_sensitive,
-            env_prefix=env_prefix,
-            env_nested_delimiter=env_nested_delimiter,
-            env_nested_max_split=env_nested_max_split,
-            env_ignore_empty=env_ignore_empty,
-            env_parse_none_str=env_parse_none_str,
-            env_parse_enums=env_parse_enums,
-        )
-        dotenv_settings = DotEnvSettingsSource(
-            self.__class__,
-            env_file=env_file,
-            env_file_encoding=env_file_encoding,
-            case_sensitive=case_sensitive,
-            env_prefix=env_prefix,
-            env_nested_delimiter=env_nested_delimiter,
-            env_nested_max_split=env_nested_max_split,
-            env_ignore_empty=env_ignore_empty,
-            env_parse_none_str=env_parse_none_str,
-            env_parse_enums=env_parse_enums,
-        )
-
-        file_secret_settings = SecretsSettingsSource(
-            self.__class__, secrets_dir=secrets_dir, case_sensitive=case_sensitive, env_prefix=env_prefix
-        )
-        # Provide a hook to set built-in sources priority and add / remove sources
-        sources = self.settings_customise_sources(
-            self.__class__,
-            init_settings=init_settings,
-            env_settings=env_settings,
-            dotenv_settings=dotenv_settings,
-            file_secret_settings=file_secret_settings,
-        ) + (default_settings,)
-        if not any([source for source in sources if isinstance(source, CliSettingsSource)]):
-            if isinstance(cli_settings_source, CliSettingsSource):
-                sources = (cli_settings_source,) + sources
-            elif cli_parse_args is not None:
-                cli_settings = CliSettingsSource[Any](
-                    self.__class__,
-                    cli_prog_name=cli_prog_name,
-                    cli_parse_args=cli_parse_args,
-                    cli_parse_none_str=cli_parse_none_str,
-                    cli_hide_none_type=cli_hide_none_type,
-                    cli_avoid_json=cli_avoid_json,
-                    cli_enforce_required=cli_enforce_required,
-                    cli_use_class_docs_for_groups=cli_use_class_docs_for_groups,
-                    cli_exit_on_error=cli_exit_on_error,
-                    cli_prefix=cli_prefix,
-                    cli_flag_prefix_char=cli_flag_prefix_char,
-                    cli_implicit_flags=cli_implicit_flags,
-                    cli_ignore_unknown_args=cli_ignore_unknown_args,
-                    cli_kebab_case=cli_kebab_case,
-                    cli_shortcuts=cli_shortcuts,
-                    case_sensitive=case_sensitive,
-                )
-                sources = (cli_settings,) + sources
-        if sources:
-            state: dict[str, Any] = {}
-            states: dict[str, dict[str, Any]] = {}
-            for source in sources:
-                if isinstance(source, PydanticBaseSettingsSource):
-                    source._set_current_state(state)
-                    source._set_settings_sources_data(states)
-
-                source_name = source.__name__ if hasattr(source, '__name__') else type(source).__name__
-                source_state = source()
-
-                states[source_name] = source_state
-                state = deep_update(source_state, state)
-            return state
-        else:
-            # no one should mean to do this, but I think returning an empty dict is marginally preferable
-            # to an informative error and much better than a confusing error
-            return {}
-
-    model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(
-        extra='forbid',
-        arbitrary_types_allowed=True,
-        validate_default=True,
-        case_sensitive=False,
-        env_prefix='',
-        nested_model_default_partial_update=False,
-        env_file=None,
-        env_file_encoding=None,
-        env_ignore_empty=False,
-        env_nested_delimiter=None,
-        env_nested_max_split=None,
-        env_parse_none_str=None,
-        env_parse_enums=None,
-        cli_prog_name=None,
-        cli_parse_args=None,
-        cli_parse_none_str=None,
-        cli_hide_none_type=False,
-        cli_avoid_json=False,
-        cli_enforce_required=False,
-        cli_use_class_docs_for_groups=False,
-        cli_exit_on_error=True,
-        cli_prefix='',
-        cli_flag_prefix_char='-',
-        cli_implicit_flags=False,
-        cli_ignore_unknown_args=False,
-        cli_kebab_case=False,
-        cli_shortcuts=None,
-        json_file=None,
-        json_file_encoding=None,
-        yaml_file=None,
-        yaml_file_encoding=None,
-        yaml_config_section=None,
-        toml_file=None,
-        secrets_dir=None,
-        protected_namespaces=('model_validate', 'model_dump', 'settings_customise_sources'),
-        enable_decoding=True,
-    )
-
-
-class CliApp:
-    """
-    A utility class for running Pydantic `BaseSettings`, `BaseModel`, or `pydantic.dataclasses.dataclass` as
-    CLI applications.
-    """
-
-    @staticmethod
-    def _run_cli_cmd(model: Any, cli_cmd_method_name: str, is_required: bool) -> Any:
-        command = getattr(type(model), cli_cmd_method_name, None)
-        if command is None:
-            if is_required:
-                raise SettingsError(f'Error: {type(model).__name__} class is missing {cli_cmd_method_name} entrypoint')
-            return model
-
-        # If the method is asynchronous, we handle its execution based on the current event loop status.
-        if inspect.iscoroutinefunction(command):
-            # For asynchronous methods, we have two execution scenarios:
-            # 1. If no event loop is running in the current thread, run the coroutine directly with asyncio.run().
-            # 2. If an event loop is already running in the current thread, run the coroutine in a separate thread to avoid conflicts.
-            try:
-                # Check if an event loop is currently running in this thread.
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop and loop.is_running():
-                # We're in a context with an active event loop (e.g., Jupyter Notebook).
-                # Running asyncio.run() here would cause conflicts, so we use a separate thread.
-                exception_container = []
-
-                def run_coro() -> None:
-                    try:
-                        # Execute the coroutine in a new event loop in this separate thread.
-                        asyncio.run(command(model))
-                    except Exception as e:
-                        exception_container.append(e)
-
-                thread = threading.Thread(target=run_coro)
-                thread.start()
-                thread.join()
-                if exception_container:
-                    # Propagate exceptions from the separate thread.
-                    raise exception_container[0]
+    force_polling = _default_force_polling(force_polling)
+    poll_delay_ms = _default_poll_delay_ms(poll_delay_ms)
+    ignore_permission_denied = _default_ignore_permission_denied(ignore_permission_denied)
+    debug = _default_debug(debug)
+    with RustNotify(
+        [str(p) for p in paths], debug, force_polling, poll_delay_ms, recursive, ignore_permission_denied
+    ) as watcher:
+        while True:
+            raw_changes = watcher.watch(debounce, step, rust_timeout, stop_event)
+            if raw_changes == 'timeout':
+                if yield_on_timeout:
+                    yield set()
+                else:
+                    logger.debug('rust notify timeout, continuing')
+            elif raw_changes == 'signal':
+                if raise_interrupt:
+                    raise KeyboardInterrupt
+                else:
+                    logger.warning('KeyboardInterrupt caught, stopping watch')
+                    return
+            elif raw_changes == 'stop':
+                return
             else:
-                # No event loop is running; safe to run the coroutine directly.
-                asyncio.run(command(model))
-        else:
-            # For synchronous methods, call them directly.
-            command(model)
+                changes = _prep_changes(raw_changes, watch_filter)
+                if changes:
+                    _log_changes(changes)
+                    yield changes
+                else:
+                    logger.debug('all changes filtered out, raw_changes=%s', raw_changes)
 
-        return model
 
-    @staticmethod
-    def run(
-        model_cls: type[T],
-        cli_args: list[str] | Namespace | SimpleNamespace | dict[str, Any] | None = None,
-        cli_settings_source: CliSettingsSource[Any] | None = None,
-        cli_exit_on_error: bool | None = None,
-        cli_cmd_method_name: str = 'cli_cmd',
-        **model_init_data: Any,
-    ) -> T:
-        """
-        Runs a Pydantic `BaseSettings`, `BaseModel`, or `pydantic.dataclasses.dataclass` as a CLI application.
-        Running a model as a CLI application requires the `cli_cmd` method to be defined in the model class.
+async def awatch(  # C901
+    *paths: Path | str,
+    watch_filter: Callable[[Change, str], bool] | None = DefaultFilter(),
+    debounce: int = 1_600,
+    step: int = 50,
+    stop_event: 'AnyEvent | None' = None,
+    rust_timeout: int | None = None,
+    yield_on_timeout: bool = False,
+    debug: bool | None = None,
+    raise_interrupt: bool | None = None,
+    force_polling: bool | None = None,
+    poll_delay_ms: int = 300,
+    recursive: bool = True,
+    ignore_permission_denied: bool | None = None,
+) -> AsyncGenerator[set[FileChange], None]:
+    """
+    Asynchronous equivalent of [`watch`][watchfiles.watch] using threads to wait for changes.
+    Arguments match those of [`watch`][watchfiles.watch] except `stop_event`.
 
-        Args:
-            model_cls: The model class to run as a CLI application.
-            cli_args: The list of CLI arguments to parse. If `cli_settings_source` is specified, this may
-                also be a namespace or dictionary of pre-parsed CLI arguments. Defaults to `sys.argv[1:]`.
-            cli_settings_source: Override the default CLI settings source with a user defined instance.
-                Defaults to `None`.
-            cli_exit_on_error: Determines whether this function exits on error. If model is subclass of
-                `BaseSettings`, defaults to BaseSettings `cli_exit_on_error` value. Otherwise, defaults to
-                `True`.
-            cli_cmd_method_name: The CLI command method name to run. Defaults to "cli_cmd".
-            model_init_data: The model init data.
+    All async methods use [anyio](https://anyio.readthedocs.io/en/latest/) to run the event loop.
 
-        Returns:
-            The ran instance of model.
+    Unlike [`watch`][watchfiles.watch] `KeyboardInterrupt` cannot be suppressed by `awatch` so they need to be caught
+    where `asyncio.run` or equivalent is called.
 
-        Raises:
-            SettingsError: If model_cls is not subclass of `BaseModel` or `pydantic.dataclasses.dataclass`.
-            SettingsError: If model_cls does not have a `cli_cmd` entrypoint defined.
-        """
+    Args:
+        *paths: filesystem paths to watch.
+        watch_filter: matches the same argument of [`watch`][watchfiles.watch].
+        debounce: matches the same argument of [`watch`][watchfiles.watch].
+        step: matches the same argument of [`watch`][watchfiles.watch].
+        stop_event: `anyio.Event` which can be used to stop iteration, see example below.
+        rust_timeout: matches the same argument of [`watch`][watchfiles.watch], except that `None` means
+            use `1_000` on Windows and `5_000` on other platforms thus helping with exiting on `Ctrl+C` on Windows,
+            see [#110](https://github.com/samuelcolvin/watchfiles/issues/110).
+        yield_on_timeout: matches the same argument of [`watch`][watchfiles.watch].
+        debug: matches the same argument of [`watch`][watchfiles.watch].
+        raise_interrupt: This is deprecated, `KeyboardInterrupt` will cause this coroutine to be cancelled and then
+            be raised by the top level `asyncio.run` call or equivalent, and should be caught there.
+            See [#136](https://github.com/samuelcolvin/watchfiles/issues/136)
+        force_polling: if true, always use polling instead of file system notifications, default is `None` where
+            `force_polling` is set to `True` if the `WATCHFILES_FORCE_POLLING` environment variable exists.
+        poll_delay_ms: delay between polling for changes, only used if `force_polling=True`.
+            `poll_delay_ms` can be changed via the `WATCHFILES_POLL_DELAY_MS` environment variable.
+        recursive: if `True`, watch for changes in sub-directories recursively, otherwise watch only for changes in the
+            top-level directory, default is `True`.
+        ignore_permission_denied: if `True`, will ignore permission denied errors, otherwise will raise them by default.
+            Setting the `WATCHFILES_IGNORE_PERMISSION_DENIED` environment variable will set this value too.
 
-        if not (is_pydantic_dataclass(model_cls) or is_model_class(model_cls)):
-            raise SettingsError(
-                f'Error: {model_cls.__name__} is not subclass of BaseModel or pydantic.dataclasses.dataclass'
-            )
+    Yields:
+        The generator yields sets of [`FileChange`][watchfiles.main.FileChange]s.
 
-        cli_settings = None
-        cli_parse_args = True if cli_args is None else cli_args
-        if cli_settings_source is not None:
-            if isinstance(cli_parse_args, (Namespace, SimpleNamespace, dict)):
-                cli_settings = cli_settings_source(parsed_args=cli_parse_args)
+    ```py title="Example of awatch usage"
+    import asyncio
+    from watchfiles import awatch
+
+    async def main():
+        async for changes in awatch('./first/dir', './second/dir'):
+            print(changes)
+
+    if __name__ == '__main__':
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            print('stopped via KeyboardInterrupt')
+    ```
+
+    ```py title="Example of awatch usage with a stop event"
+    import asyncio
+    from watchfiles import awatch
+
+    async def main():
+        stop_event = asyncio.Event()
+
+        async def stop_soon():
+            await asyncio.sleep(3)
+            stop_event.set()
+
+        stop_soon_task = asyncio.create_task(stop_soon())
+
+        async for changes in awatch('/path/to/dir', stop_event=stop_event):
+            print(changes)
+
+        # cleanup by awaiting the (now complete) stop_soon_task
+        await stop_soon_task
+
+    asyncio.run(main())
+    ```
+    """
+    if raise_interrupt is not None:
+        warnings.warn(
+            'raise_interrupt is deprecated, KeyboardInterrupt will cause this coroutine to be cancelled and then '
+            'be raised by the top level asyncio.run call or equivalent, and should be caught there. See #136.',
+            DeprecationWarning,
+        )
+
+    if stop_event is None:
+        stop_event_: AnyEvent = anyio.Event()
+    else:
+        stop_event_ = stop_event
+
+    force_polling = _default_force_polling(force_polling)
+    poll_delay_ms = _default_poll_delay_ms(poll_delay_ms)
+    ignore_permission_denied = _default_ignore_permission_denied(ignore_permission_denied)
+    debug = _default_debug(debug)
+    with RustNotify(
+        [str(p) for p in paths], debug, force_polling, poll_delay_ms, recursive, ignore_permission_denied
+    ) as watcher:
+        timeout = _calc_async_timeout(rust_timeout)
+        CancelledError = anyio.get_cancelled_exc_class()
+
+        while True:
+            async with anyio.create_task_group() as tg:
+                try:
+                    raw_changes = await anyio.to_thread.run_sync(watcher.watch, debounce, step, timeout, stop_event_)
+                except (CancelledError, KeyboardInterrupt):
+                    stop_event_.set()
+                    # suppressing KeyboardInterrupt wouldn't stop it getting raised by the top level asyncio.run call
+                    raise
+                tg.cancel_scope.cancel()
+
+            if raw_changes == 'timeout':
+                if yield_on_timeout:
+                    yield set()
+                else:
+                    logger.debug('rust notify timeout, continuing')
+            elif raw_changes == 'stop':
+                return
+            elif raw_changes == 'signal':
+                # in theory the watch thread should never get a signal
+                raise RuntimeError('watch thread unexpectedly received a signal')
             else:
-                cli_settings = cli_settings_source(args=cli_parse_args)
-        elif isinstance(cli_parse_args, (Namespace, SimpleNamespace, dict)):
-            raise SettingsError('Error: `cli_args` must be list[str] or None when `cli_settings_source` is not used')
+                changes = _prep_changes(raw_changes, watch_filter)
+                if changes:
+                    _log_changes(changes)
+                    yield changes
+                else:
+                    logger.debug('all changes filtered out, raw_changes=%s', raw_changes)
 
-        model_init_data['_cli_parse_args'] = cli_parse_args
-        model_init_data['_cli_exit_on_error'] = cli_exit_on_error
-        model_init_data['_cli_settings_source'] = cli_settings
-        if not issubclass(model_cls, BaseSettings):
 
-            class CliAppBaseSettings(BaseSettings, model_cls):  # type: ignore
-                __doc__ = model_cls.__doc__
-                model_config = SettingsConfigDict(
-                    nested_model_default_partial_update=True,
-                    case_sensitive=True,
-                    cli_hide_none_type=True,
-                    cli_avoid_json=True,
-                    cli_enforce_required=True,
-                    cli_implicit_flags=True,
-                    cli_kebab_case=True,
-                )
+def _prep_changes(
+    raw_changes: set[tuple[int, str]], watch_filter: Callable[[Change, str], bool] | None
+) -> set[FileChange]:
+    # if we wanted to be really snazzy, we could move this into rust
+    changes = {(Change(change), path) for change, path in raw_changes}
+    if watch_filter:
+        changes = {c for c in changes if watch_filter(c[0], c[1])}
+    return changes
 
-            model = CliAppBaseSettings(**model_init_data)
-            model_init_data = {}
-            for field_name, field_info in type(model).model_fields.items():
-                model_init_data[_field_name_for_signature(field_name, field_info)] = getattr(model, field_name)
 
-        return CliApp._run_cli_cmd(model_cls(**model_init_data), cli_cmd_method_name, is_required=False)
+def _log_changes(changes: set[FileChange]) -> None:
+    if logger.isEnabledFor(logging.INFO):  # pragma: no branch
+        count = len(changes)
+        plural = '' if count == 1 else 's'
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug('%d change%s detected: %s', count, plural, changes)
+        else:
+            logger.info('%d change%s detected', count, plural)
 
-    @staticmethod
-    def run_subcommand(
-        model: PydanticModel, cli_exit_on_error: bool | None = None, cli_cmd_method_name: str = 'cli_cmd'
-    ) -> PydanticModel:
-        """
-        Runs the model subcommand. Running a model subcommand requires the `cli_cmd` method to be defined in
-        the nested model subcommand class.
 
-        Args:
-            model: The model to run the subcommand from.
-            cli_exit_on_error: Determines whether this function exits with error if no subcommand is found.
-                Defaults to model_config `cli_exit_on_error` value if set. Otherwise, defaults to `True`.
-            cli_cmd_method_name: The CLI command method name to run. Defaults to "cli_cmd".
+def _calc_async_timeout(timeout: int | None) -> int:
+    """
+    see https://github.com/samuelcolvin/watchfiles/issues/110
+    """
+    if timeout is None:
+        if sys.platform == 'win32':
+            return 1_000
+        else:
+            return 5_000
+    else:
+        return timeout
 
-        Returns:
-            The ran subcommand model.
 
-        Raises:
-            SystemExit: When no subcommand is found and cli_exit_on_error=`True` (the default).
-            SettingsError: When no subcommand is found and cli_exit_on_error=`False`.
-        """
+def _default_force_polling(force_polling: bool | None) -> bool:
+    """
+    See docstring for `watch` above for details.
 
-        subcommand = get_subcommand(model, is_required=True, cli_exit_on_error=cli_exit_on_error)
-        return CliApp._run_cli_cmd(subcommand, cli_cmd_method_name, is_required=True)
+    See samuelcolvin/watchfiles#167 and samuelcolvin/watchfiles#187 for discussion and rationale.
+    """
+    if force_polling is not None:
+        return force_polling
+    env_var = os.getenv('WATCHFILES_FORCE_POLLING')
+    if env_var:
+        return env_var.lower() not in {'false', 'disable', 'disabled'}
+    else:
+        return _auto_force_polling()
+
+
+def _default_poll_delay_ms(poll_delay_ms: int) -> int:
+    """
+    See docstring for `watch` above for details.
+    """
+    env_var = os.getenv('WATCHFILES_POLL_DELAY_MS')
+    if env_var and env_var.isdecimal():
+        return int(env_var)
+    else:
+        return poll_delay_ms
+
+
+def _default_debug(debug: bool | None) -> bool:
+    if debug is not None:
+        return debug
+    env_var = os.getenv('WATCHFILES_DEBUG')
+    return bool(env_var)
+
+
+def _auto_force_polling() -> bool:
+    """
+    Whether to auto-enable force polling, it should be enabled automatically only on WSL.
+
+    See samuelcolvin/watchfiles#187 for discussion.
+    """
+    import platform
+
+    uname = platform.uname()
+    return 'microsoft-standard' in uname.release.lower() and uname.system.lower() == 'linux'
+
+
+def _default_ignore_permission_denied(ignore_permission_denied: bool | None) -> bool:
+    if ignore_permission_denied is not None:
+        return ignore_permission_denied
+    env_var = os.getenv('WATCHFILES_IGNORE_PERMISSION_DENIED')
+    return bool(env_var)

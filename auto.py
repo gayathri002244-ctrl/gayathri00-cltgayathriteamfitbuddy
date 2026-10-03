@@ -1,52 +1,17 @@
 from __future__ import annotations
 
-import typing
-
-from .._synchronization import current_async_library
-from .base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
+import asyncio
+from collections.abc import Callable
 
 
-class AutoBackend(AsyncNetworkBackend):
-    async def _init_backend(self) -> None:
-        if not (hasattr(self, "_backend")):
-            backend = current_async_library()
-            if backend == "trio":
-                from .trio import TrioBackend
+def auto_loop_factory(use_subprocess: bool = False) -> Callable[[], asyncio.AbstractEventLoop]:
+    try:
+        import uvloop  # noqa
+    except ImportError:  # pragma: no cover
+        from uvicorn.loops.asyncio import asyncio_loop_factory as loop_factory
 
-                self._backend: AsyncNetworkBackend = TrioBackend()
-            else:
-                from .anyio import AnyIOBackend
+        return loop_factory(use_subprocess=use_subprocess)
+    else:  # pragma: no cover
+        from uvicorn.loops.uvloop import uvloop_loop_factory
 
-                self._backend = AnyIOBackend()
-
-    async def connect_tcp(
-        self,
-        host: str,
-        port: int,
-        timeout: float | None = None,
-        local_address: str | None = None,
-        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
-    ) -> AsyncNetworkStream:
-        await self._init_backend()
-        return await self._backend.connect_tcp(
-            host,
-            port,
-            timeout=timeout,
-            local_address=local_address,
-            socket_options=socket_options,
-        )
-
-    async def connect_unix_socket(
-        self,
-        path: str,
-        timeout: float | None = None,
-        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
-    ) -> AsyncNetworkStream:  # pragma: nocover
-        await self._init_backend()
-        return await self._backend.connect_unix_socket(
-            path, timeout=timeout, socket_options=socket_options
-        )
-
-    async def sleep(self, seconds: float) -> None:  # pragma: nocover
-        await self._init_backend()
-        return await self._backend.sleep(seconds)
+        return uvloop_loop_factory(use_subprocess=use_subprocess)
