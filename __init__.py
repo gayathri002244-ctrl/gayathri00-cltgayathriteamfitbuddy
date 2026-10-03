@@ -1,25 +1,25 @@
-"""FastAPI framework, high performance, easy to learn, fast to code, ready for production"""
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
-__version__ = "0.117.1"
+"""Google Gen AI SDK"""
 
-from starlette import status as status
+from . import types
+from . import version
+from .client import Client
 
-from .applications import FastAPI as FastAPI
-from .background import BackgroundTasks as BackgroundTasks
-from .datastructures import UploadFile as UploadFile
-from .exceptions import HTTPException as HTTPException
-from .exceptions import WebSocketException as WebSocketException
-from .param_functions import Body as Body
-from .param_functions import Cookie as Cookie
-from .param_functions import Depends as Depends
-from .param_functions import File as File
-from .param_functions import Form as Form
-from .param_functions import Header as Header
-from .param_functions import Path as Path
-from .param_functions import Query as Query
-from .param_functions import Security as Security
-from .requests import Request as Request
-from .responses import Response as Response
-from .routing import APIRouter as APIRouter
-from .websockets import WebSocket as WebSocket
-from .websockets import WebSocketDisconnect as WebSocketDisconnect
+
+__version__ = version.__version__
+
+__all__ = ['Client']
