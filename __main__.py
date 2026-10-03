@@ -1,6 +1,3 @@
-from __future__ import annotations
+from fastapi.cli import main
 
-from .cli import cli_detect
-
-if __name__ == "__main__":
-    cli_detect()
+main()
