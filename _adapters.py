@@ -1,55 +1,170 @@
-# Copyright 2025 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
+from contextlib import suppress
+from io import TextIOWrapper
 
-import typing
-
-from ._mcp_utils import mcp_to_gemini_tools
-from .types import FunctionCall, Tool
-
-if typing.TYPE_CHECKING:
-  from mcp import types as mcp_types
-  from mcp import ClientSession
+from . import abc
 
 
-class McpToGenAiToolAdapter:
-  """Adapter for working with MCP tools in a GenAI client."""
+class SpecLoaderAdapter:
+    """
+    Adapt a package spec to adapt the underlying loader.
+    """
 
-  def __init__(
-      self,
-      session: "mcp.ClientSession",  # type: ignore # noqa: F821
-      list_tools_result: "mcp_types.ListToolsResult",  # type: ignore
-  ) -> None:
-    self._mcp_session = session
-    self._list_tools_result = list_tools_result
+    def __init__(self, spec, adapter=lambda spec: spec.loader):
+        self.spec = spec
+        self.loader = adapter(spec)
 
-  async def call_tool(
-      self, function_call: FunctionCall
-  ) -> "mcp_types.CallToolResult":  # type: ignore
-    """Calls a function on the MCP server."""
-    name = function_call.name if function_call.name else ""
-    arguments = dict(function_call.args) if function_call.args else {}
+    def __getattr__(self, name):
+        return getattr(self.spec, name)
 
-    return typing.cast(
-        "mcp_types.CallToolResult",
-        await self._mcp_session.call_tool(
-            name=name,
-            arguments=arguments,
-        ),
+
+class TraversableResourcesLoader:
+    """
+    Adapt a loader to provide TraversableResources.
+    """
+
+    def __init__(self, spec):
+        self.spec = spec
+
+    def get_resource_reader(self, name):
+        return CompatibilityFiles(self.spec)._native()
+
+
+def _io_wrapper(file, mode='r', *args, **kwargs):
+    if mode == 'r':
+        return TextIOWrapper(file, *args, **kwargs)
+    elif mode == 'rb':
+        return file
+    raise ValueError(
+        "Invalid mode value '{}', only 'r' and 'rb' are supported".format(mode)
     )
 
-  @property
-  def tools(self) -> list[Tool]:
-    """Returns a list of Google GenAI tools."""
-    return mcp_to_gemini_tools(self._list_tools_result.tools)
+
+class CompatibilityFiles:
+    """
+    Adapter for an existing or non-existent resource reader
+    to provide a compatibility .files().
+    """
+
+    class SpecPath(abc.Traversable):
+        """
+        Path tied to a module spec.
+        Can be read and exposes the resource reader children.
+        """
+
+        def __init__(self, spec, reader):
+            self._spec = spec
+            self._reader = reader
+
+        def iterdir(self):
+            if not self._reader:
+                return iter(())
+            return iter(
+                CompatibilityFiles.ChildPath(self._reader, path)
+                for path in self._reader.contents()
+            )
+
+        def is_file(self):
+            return False
+
+        is_dir = is_file
+
+        def joinpath(self, other):
+            if not self._reader:
+                return CompatibilityFiles.OrphanPath(other)
+            return CompatibilityFiles.ChildPath(self._reader, other)
+
+        @property
+        def name(self):
+            return self._spec.name
+
+        def open(self, mode='r', *args, **kwargs):
+            return _io_wrapper(self._reader.open_resource(None), mode, *args, **kwargs)
+
+    class ChildPath(abc.Traversable):
+        """
+        Path tied to a resource reader child.
+        Can be read but doesn't expose any meaningful children.
+        """
+
+        def __init__(self, reader, name):
+            self._reader = reader
+            self._name = name
+
+        def iterdir(self):
+            return iter(())
+
+        def is_file(self):
+            return self._reader.is_resource(self.name)
+
+        def is_dir(self):
+            return not self.is_file()
+
+        def joinpath(self, other):
+            return CompatibilityFiles.OrphanPath(self.name, other)
+
+        @property
+        def name(self):
+            return self._name
+
+        def open(self, mode='r', *args, **kwargs):
+            return _io_wrapper(
+                self._reader.open_resource(self.name), mode, *args, **kwargs
+            )
+
+    class OrphanPath(abc.Traversable):
+        """
+        Orphan path, not tied to a module spec or resource reader.
+        Can't be read and doesn't expose any meaningful children.
+        """
+
+        def __init__(self, *path_parts):
+            if len(path_parts) < 1:
+                raise ValueError('Need at least one path part to construct a path')
+            self._path = path_parts
+
+        def iterdir(self):
+            return iter(())
+
+        def is_file(self):
+            return False
+
+        is_dir = is_file
+
+        def joinpath(self, other):
+            return CompatibilityFiles.OrphanPath(*self._path, other)
+
+        @property
+        def name(self):
+            return self._path[-1]
+
+        def open(self, mode='r', *args, **kwargs):
+            raise FileNotFoundError("Can't open orphan path")
+
+    def __init__(self, spec):
+        self.spec = spec
+
+    @property
+    def _reader(self):
+        with suppress(AttributeError):
+            return self.spec.loader.get_resource_reader(self.spec.name)
+
+    def _native(self):
+        """
+        Return the native reader if it supports files().
+        """
+        reader = self._reader
+        return reader if hasattr(reader, 'files') else self
+
+    def __getattr__(self, attr):
+        return getattr(self._reader, attr)
+
+    def files(self):
+        return CompatibilityFiles.SpecPath(self.spec, self._reader)
+
+
+def wrap_spec(package):
+    """
+    Construct a package spec with traversable compatibility
+    on the spec/loader/reader.
+    """
+    return SpecLoaderAdapter(package.__spec__, TraversableResourcesLoader)

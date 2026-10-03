@@ -1,39 +1,76 @@
-from .connection import AsyncHTTPConnection
-from .connection_pool import AsyncConnectionPool
-from .http11 import AsyncHTTP11Connection
-from .http_proxy import AsyncHTTPProxy
-from .interfaces import AsyncConnectionInterface
+import importlib.util
+import sys
 
-try:
-    from .http2 import AsyncHTTP2Connection
-except ImportError:  # pragma: nocover
 
-    class AsyncHTTP2Connection:  # type: ignore
-        def __init__(self, *args, **kwargs) -> None:  # type: ignore
-            raise RuntimeError(
-                "Attempted to use http2 support, but the `h2` package is not "
-                "installed. Use 'pip install httpcore[http2]'."
+class VendorImporter:
+    """
+    A PEP 302 meta path importer for finding optionally-vendored
+    or otherwise naturally-installed packages from root_name.
+    """
+
+    def __init__(self, root_name, vendored_names=(), vendor_pkg=None):
+        self.root_name = root_name
+        self.vendored_names = set(vendored_names)
+        self.vendor_pkg = vendor_pkg or root_name.replace('extern', '_vendor')
+
+    @property
+    def search_path(self):
+        """
+        Search first the vendor package then as a natural package.
+        """
+        yield self.vendor_pkg + '.'
+        yield ''
+
+    def _module_matches_namespace(self, fullname):
+        """Figure out if the target module is vendored."""
+        root, base, target = fullname.partition(self.root_name + '.')
+        return not root and any(map(target.startswith, self.vendored_names))
+
+    def load_module(self, fullname):
+        """
+        Iterate over the search path to locate and load fullname.
+        """
+        root, base, target = fullname.partition(self.root_name + '.')
+        for prefix in self.search_path:
+            try:
+                extant = prefix + target
+                __import__(extant)
+                mod = sys.modules[extant]
+                sys.modules[fullname] = mod
+                return mod
+            except ImportError:
+                pass
+        else:
+            raise ImportError(
+                "The '{target}' package is required; "
+                "normally this is bundled with this package so if you get "
+                "this warning, consult the packager of your "
+                "distribution.".format(**locals())
             )
 
+    def create_module(self, spec):
+        return self.load_module(spec.name)
 
-try:
-    from .socks_proxy import AsyncSOCKSProxy
-except ImportError:  # pragma: nocover
+    def exec_module(self, module):
+        pass
 
-    class AsyncSOCKSProxy:  # type: ignore
-        def __init__(self, *args, **kwargs) -> None:  # type: ignore
-            raise RuntimeError(
-                "Attempted to use SOCKS support, but the `socksio` package is not "
-                "installed. Use 'pip install httpcore[socks]'."
-            )
+    def find_spec(self, fullname, path=None, target=None):
+        """Return a module spec for vendored names."""
+        return (
+            importlib.util.spec_from_loader(fullname, self)
+            if self._module_matches_namespace(fullname) else None
+        )
+
+    def install(self):
+        """
+        Install this importer into sys.meta_path if not already present.
+        """
+        if self not in sys.meta_path:
+            sys.meta_path.append(self)
 
 
-__all__ = [
-    "AsyncHTTPConnection",
-    "AsyncConnectionPool",
-    "AsyncHTTPProxy",
-    "AsyncHTTP11Connection",
-    "AsyncHTTP2Connection",
-    "AsyncConnectionInterface",
-    "AsyncSOCKSProxy",
-]
+names = (
+    'packaging', 'pyparsing', 'appdirs', 'jaraco', 'importlib_resources',
+    'more_itertools',
+)
+VendorImporter(__name__, names).install()
