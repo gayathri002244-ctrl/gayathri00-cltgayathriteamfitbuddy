@@ -1,34 +1,33 @@
-class FormParserError(ValueError):
-    """Base error class for our form parser."""
+from __future__ import annotations
+
+import http
+from collections.abc import Mapping
 
 
-class ParseError(FormParserError):
-    """This exception (or a subclass) is raised when there is an error while
-    parsing something.
-    """
+class HTTPException(Exception):
+    def __init__(self, status_code: int, detail: str | None = None, headers: Mapping[str, str] | None = None) -> None:
+        if detail is None:
+            detail = http.HTTPStatus(status_code).phrase
+        self.status_code = status_code
+        self.detail = detail
+        self.headers = headers
 
-    #: This is the offset in the input data chunk (*NOT* the overall stream) in
-    #: which the parse error occurred.  It will be -1 if not specified.
-    offset = -1
+    def __str__(self) -> str:
+        return f"{self.status_code}: {self.detail}"
 
-
-class MultipartParseError(ParseError):
-    """This is a specific error that is raised when the MultipartParser detects
-    an error while parsing.
-    """
-
-
-class QuerystringParseError(ParseError):
-    """This is a specific error that is raised when the QuerystringParser
-    detects an error while parsing.
-    """
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+        return f"{class_name}(status_code={self.status_code!r}, detail={self.detail!r})"
 
 
-class DecodeError(ParseError):
-    """This exception is raised when there is a decoding error - for example
-    with the Base64Decoder or QuotedPrintableDecoder.
-    """
+class WebSocketException(Exception):
+    def __init__(self, code: int, reason: str | None = None) -> None:
+        self.code = code
+        self.reason = reason or ""
 
+    def __str__(self) -> str:
+        return f"{self.code}: {self.reason}"
 
-class FileError(FormParserError, OSError):
-    """Exception class for problems with the File class."""
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+        return f"{class_name}(code={self.code!r}, reason={self.reason!r})"

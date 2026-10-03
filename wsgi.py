@@ -1,149 +1,153 @@
 from __future__ import annotations
 
 import io
-import itertools
+import math
 import sys
-import typing
+import warnings
+from collections.abc import MutableMapping
+from typing import Any, Callable
 
-from .._models import Request, Response
-from .._types import SyncByteStream
-from .base import BaseTransport
+import anyio
+from anyio.abc import ObjectReceiveStream, ObjectSendStream
 
-if typing.TYPE_CHECKING:
-    from _typeshed import OptExcInfo  # pragma: no cover
-    from _typeshed.wsgi import WSGIApplication  # pragma: no cover
+from starlette.types import Receive, Scope, Send
 
-_T = typing.TypeVar("_T")
-
-
-__all__ = ["WSGITransport"]
-
-
-def _skip_leading_empty_chunks(body: typing.Iterable[_T]) -> typing.Iterable[_T]:
-    body = iter(body)
-    for chunk in body:
-        if chunk:
-            return itertools.chain([chunk], body)
-    return []
+warnings.warn(
+    "starlette.middleware.wsgi is deprecated and will be removed in a future release. "
+    "Please refer to https://github.com/abersheeran/a2wsgi as a replacement.",
+    DeprecationWarning,
+)
 
 
-class WSGIByteStream(SyncByteStream):
-    def __init__(self, result: typing.Iterable[bytes]) -> None:
-        self._close = getattr(result, "close", None)
-        self._result = _skip_leading_empty_chunks(result)
-
-    def __iter__(self) -> typing.Iterator[bytes]:
-        for part in self._result:
-            yield part
-
-    def close(self) -> None:
-        if self._close is not None:
-            self._close()
-
-
-class WSGITransport(BaseTransport):
+def build_environ(scope: Scope, body: bytes) -> dict[str, Any]:
     """
-    A custom transport that handles sending requests directly to an WSGI app.
-    The simplest way to use this functionality is to use the `app` argument.
-
-    ```
-    client = httpx.Client(app=app)
-    ```
-
-    Alternatively, you can setup the transport instance explicitly.
-    This allows you to include any additional configuration arguments specific
-    to the WSGITransport class:
-
-    ```
-    transport = httpx.WSGITransport(
-        app=app,
-        script_name="/submount",
-        remote_addr="1.2.3.4"
-    )
-    client = httpx.Client(transport=transport)
-    ```
-
-    Arguments:
-
-    * `app` - The WSGI application.
-    * `raise_app_exceptions` - Boolean indicating if exceptions in the application
-       should be raised. Default to `True`. Can be set to `False` for use cases
-       such as testing the content of a client 500 response.
-    * `script_name` - The root path on which the WSGI application should be mounted.
-    * `remote_addr` - A string indicating the client IP of incoming requests.
-    ```
+    Builds a scope and request body into a WSGI environ object.
     """
 
-    def __init__(
-        self,
-        app: WSGIApplication,
-        raise_app_exceptions: bool = True,
-        script_name: str = "",
-        remote_addr: str = "127.0.0.1",
-        wsgi_errors: typing.TextIO | None = None,
-    ) -> None:
+    script_name = scope.get("root_path", "").encode("utf8").decode("latin1")
+    path_info = scope["path"].encode("utf8").decode("latin1")
+    if path_info.startswith(script_name):
+        path_info = path_info[len(script_name) :]
+
+    environ = {
+        "REQUEST_METHOD": scope["method"],
+        "SCRIPT_NAME": script_name,
+        "PATH_INFO": path_info,
+        "QUERY_STRING": scope["query_string"].decode("ascii"),
+        "SERVER_PROTOCOL": f"HTTP/{scope['http_version']}",
+        "wsgi.version": (1, 0),
+        "wsgi.url_scheme": scope.get("scheme", "http"),
+        "wsgi.input": io.BytesIO(body),
+        "wsgi.errors": sys.stdout,
+        "wsgi.multithread": True,
+        "wsgi.multiprocess": True,
+        "wsgi.run_once": False,
+    }
+
+    # Get server name and port - required in WSGI, not in ASGI
+    server = scope.get("server") or ("localhost", 80)
+    environ["SERVER_NAME"] = server[0]
+    environ["SERVER_PORT"] = server[1]
+
+    # Get client IP address
+    if scope.get("client"):
+        environ["REMOTE_ADDR"] = scope["client"][0]
+
+    # Go through headers and make them into environ entries
+    for name, value in scope.get("headers", []):
+        name = name.decode("latin1")
+        if name == "content-length":
+            corrected_name = "CONTENT_LENGTH"
+        elif name == "content-type":
+            corrected_name = "CONTENT_TYPE"
+        else:
+            corrected_name = f"HTTP_{name}".upper().replace("-", "_")
+        # HTTPbis say only ASCII chars are allowed in headers, but we latin1 just in
+        # case
+        value = value.decode("latin1")
+        if corrected_name in environ:
+            value = environ[corrected_name] + "," + value
+        environ[corrected_name] = value
+    return environ
+
+
+class WSGIMiddleware:
+    def __init__(self, app: Callable[..., Any]) -> None:
         self.app = app
-        self.raise_app_exceptions = raise_app_exceptions
-        self.script_name = script_name
-        self.remote_addr = remote_addr
-        self.wsgi_errors = wsgi_errors
 
-    def handle_request(self, request: Request) -> Response:
-        request.read()
-        wsgi_input = io.BytesIO(request.content)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        assert scope["type"] == "http"
+        responder = WSGIResponder(self.app, scope)
+        await responder(receive, send)
 
-        port = request.url.port or {"http": 80, "https": 443}[request.url.scheme]
-        environ = {
-            "wsgi.version": (1, 0),
-            "wsgi.url_scheme": request.url.scheme,
-            "wsgi.input": wsgi_input,
-            "wsgi.errors": self.wsgi_errors or sys.stderr,
-            "wsgi.multithread": True,
-            "wsgi.multiprocess": False,
-            "wsgi.run_once": False,
-            "REQUEST_METHOD": request.method,
-            "SCRIPT_NAME": self.script_name,
-            "PATH_INFO": request.url.path,
-            "QUERY_STRING": request.url.query.decode("ascii"),
-            "SERVER_NAME": request.url.host,
-            "SERVER_PORT": str(port),
-            "SERVER_PROTOCOL": "HTTP/1.1",
-            "REMOTE_ADDR": self.remote_addr,
-        }
-        for header_key, header_value in request.headers.raw:
-            key = header_key.decode("ascii").upper().replace("-", "_")
-            if key not in ("CONTENT_TYPE", "CONTENT_LENGTH"):
-                key = "HTTP_" + key
-            environ[key] = header_value.decode("ascii")
 
-        seen_status = None
-        seen_response_headers = None
-        seen_exc_info = None
+class WSGIResponder:
+    stream_send: ObjectSendStream[MutableMapping[str, Any]]
+    stream_receive: ObjectReceiveStream[MutableMapping[str, Any]]
 
-        def start_response(
-            status: str,
-            response_headers: list[tuple[str, str]],
-            exc_info: OptExcInfo | None = None,
-        ) -> typing.Callable[[bytes], typing.Any]:
-            nonlocal seen_status, seen_response_headers, seen_exc_info
-            seen_status = status
-            seen_response_headers = response_headers
-            seen_exc_info = exc_info
-            return lambda _: None
+    def __init__(self, app: Callable[..., Any], scope: Scope) -> None:
+        self.app = app
+        self.scope = scope
+        self.status = None
+        self.response_headers = None
+        self.stream_send, self.stream_receive = anyio.create_memory_object_stream(math.inf)
+        self.response_started = False
+        self.exc_info: Any = None
 
-        result = self.app(environ, start_response)
+    async def __call__(self, receive: Receive, send: Send) -> None:
+        body = b""
+        more_body = True
+        while more_body:
+            message = await receive()
+            body += message.get("body", b"")
+            more_body = message.get("more_body", False)
+        environ = build_environ(self.scope, body)
 
-        stream = WSGIByteStream(result)
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(self.sender, send)
+            async with self.stream_send:
+                await anyio.to_thread.run_sync(self.wsgi, environ, self.start_response)
+        if self.exc_info is not None:
+            raise self.exc_info[0].with_traceback(self.exc_info[1], self.exc_info[2])
 
-        assert seen_status is not None
-        assert seen_response_headers is not None
-        if seen_exc_info and seen_exc_info[0] and self.raise_app_exceptions:
-            raise seen_exc_info[1]
+    async def sender(self, send: Send) -> None:
+        async with self.stream_receive:
+            async for message in self.stream_receive:
+                await send(message)
 
-        status_code = int(seen_status.split()[0])
-        headers = [
-            (key.encode("ascii"), value.encode("ascii"))
-            for key, value in seen_response_headers
-        ]
+    def start_response(
+        self,
+        status: str,
+        response_headers: list[tuple[str, str]],
+        exc_info: Any = None,
+    ) -> None:
+        self.exc_info = exc_info
+        if not self.response_started:  # pragma: no branch
+            self.response_started = True
+            status_code_string, _ = status.split(" ", 1)
+            status_code = int(status_code_string)
+            headers = [
+                (name.strip().encode("ascii").lower(), value.strip().encode("ascii"))
+                for name, value in response_headers
+            ]
+            anyio.from_thread.run(
+                self.stream_send.send,
+                {
+                    "type": "http.response.start",
+                    "status": status_code,
+                    "headers": headers,
+                },
+            )
 
-        return Response(status_code, headers=headers, stream=stream)
+    def wsgi(
+        self,
+        environ: dict[str, Any],
+        start_response: Callable[..., Any],
+    ) -> None:
+        for chunk in self.app(environ, start_response):
+            anyio.from_thread.run(
+                self.stream_send.send,
+                {"type": "http.response.body", "body": chunk, "more_body": True},
+            )
+
+        anyio.from_thread.run(self.stream_send.send, {"type": "http.response.body", "body": b""})

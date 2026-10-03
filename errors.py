@@ -1,189 +1,259 @@
-"""Pydantic-specific errors."""
+from __future__ import annotations
 
-from __future__ import annotations as _annotations
+import html
+import inspect
+import sys
+import traceback
 
-import re
-from typing import Any, ClassVar, Literal
+from starlette._utils import is_async_callable
+from starlette.concurrency import run_in_threadpool
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, PlainTextResponse, Response
+from starlette.types import ASGIApp, ExceptionHandler, Message, Receive, Scope, Send
 
-from typing_extensions import Self
-from typing_inspection.introspection import Qualifier
+STYLES = """
+p {
+    color: #211c1c;
+}
+.traceback-container {
+    border: 1px solid #038BB8;
+}
+.traceback-title {
+    background-color: #038BB8;
+    color: lemonchiffon;
+    padding: 12px;
+    font-size: 20px;
+    margin-top: 0px;
+}
+.frame-line {
+    padding-left: 10px;
+    font-family: monospace;
+}
+.frame-filename {
+    font-family: monospace;
+}
+.center-line {
+    background-color: #038BB8;
+    color: #f9f6e1;
+    padding: 5px 0px 5px 5px;
+}
+.lineno {
+    margin-right: 5px;
+}
+.frame-title {
+    font-weight: unset;
+    padding: 10px 10px 10px 10px;
+    background-color: #E4F4FD;
+    margin-right: 10px;
+    color: #191f21;
+    font-size: 17px;
+    border: 1px solid #c7dce8;
+}
+.collapse-btn {
+    float: right;
+    padding: 0px 5px 1px 5px;
+    border: solid 1px #96aebb;
+    cursor: pointer;
+}
+.collapsed {
+  display: none;
+}
+.source-code {
+  font-family: courier;
+  font-size: small;
+  padding-bottom: 10px;
+}
+"""
 
-from pydantic._internal import _repr
+JS = """
+<script type="text/javascript">
+    function collapse(element){
+        const frameId = element.getAttribute("data-frame-id");
+        const frame = document.getElementById(frameId);
 
-from ._migration import getattr_migration
-from .version import version_short
-
-__all__ = (
-    'PydanticUserError',
-    'PydanticUndefinedAnnotation',
-    'PydanticImportError',
-    'PydanticSchemaGenerationError',
-    'PydanticInvalidForJsonSchema',
-    'PydanticForbiddenQualifier',
-    'PydanticErrorCodes',
-)
-
-# We use this URL to allow for future flexibility about how we host the docs, while allowing for Pydantic
-# code in the while with "old" URLs to still work.
-# 'u' refers to "user errors" - e.g. errors caused by developers using pydantic, as opposed to validation errors.
-DEV_ERROR_DOCS_URL = f'https://errors.pydantic.dev/{version_short()}/u/'
-PydanticErrorCodes = Literal[
-    'class-not-fully-defined',
-    'custom-json-schema',
-    'decorator-missing-field',
-    'discriminator-no-field',
-    'discriminator-alias-type',
-    'discriminator-needs-literal',
-    'discriminator-alias',
-    'discriminator-validator',
-    'callable-discriminator-no-tag',
-    'typed-dict-version',
-    'model-field-overridden',
-    'model-field-missing-annotation',
-    'config-both',
-    'removed-kwargs',
-    'circular-reference-schema',
-    'invalid-for-json-schema',
-    'json-schema-already-used',
-    'base-model-instantiated',
-    'undefined-annotation',
-    'schema-for-unknown-type',
-    'import-error',
-    'create-model-field-definitions',
-    'validator-no-fields',
-    'validator-invalid-fields',
-    'validator-instance-method',
-    'validator-input-type',
-    'root-validator-pre-skip',
-    'model-serializer-instance-method',
-    'validator-field-config-info',
-    'validator-v1-signature',
-    'validator-signature',
-    'field-serializer-signature',
-    'model-serializer-signature',
-    'multiple-field-serializers',
-    'invalid-annotated-type',
-    'type-adapter-config-unused',
-    'root-model-extra',
-    'unevaluable-type-annotation',
-    'dataclass-init-false-extra-allow',
-    'clashing-init-and-init-var',
-    'model-config-invalid-field-name',
-    'with-config-on-model',
-    'dataclass-on-model',
-    'validate-call-type',
-    'unpack-typed-dict',
-    'overlapping-unpack-typed-dict',
-    'invalid-self-type',
-    'validate-by-alias-and-name-false',
-]
-
-
-class PydanticErrorMixin:
-    """A mixin class for common functionality shared by all Pydantic-specific errors.
-
-    Attributes:
-        message: A message describing the error.
-        code: An optional error code from PydanticErrorCodes enum.
-    """
-
-    def __init__(self, message: str, *, code: PydanticErrorCodes | None) -> None:
-        self.message = message
-        self.code = code
-
-    def __str__(self) -> str:
-        if self.code is None:
-            return self.message
-        else:
-            return f'{self.message}\n\nFor further information visit {DEV_ERROR_DOCS_URL}{self.code}'
-
-
-class PydanticUserError(PydanticErrorMixin, TypeError):
-    """An error raised due to incorrect use of Pydantic."""
-
-
-class PydanticUndefinedAnnotation(PydanticErrorMixin, NameError):
-    """A subclass of `NameError` raised when handling undefined annotations during `CoreSchema` generation.
-
-    Attributes:
-        name: Name of the error.
-        message: Description of the error.
-    """
-
-    def __init__(self, name: str, message: str) -> None:
-        self.name = name
-        super().__init__(message=message, code='undefined-annotation')
-
-    @classmethod
-    def from_name_error(cls, name_error: NameError) -> Self:
-        """Convert a `NameError` to a `PydanticUndefinedAnnotation` error.
-
-        Args:
-            name_error: `NameError` to be converted.
-
-        Returns:
-            Converted `PydanticUndefinedAnnotation` error.
-        """
-        try:
-            name = name_error.name  # type: ignore  # python > 3.10
-        except AttributeError:
-            name = re.search(r".*'(.+?)'", str(name_error)).group(1)  # type: ignore[union-attr]
-        return cls(name=name, message=str(name_error))
-
-
-class PydanticImportError(PydanticErrorMixin, ImportError):
-    """An error raised when an import fails due to module changes between V1 and V2.
-
-    Attributes:
-        message: Description of the error.
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message, code='import-error')
-
-
-class PydanticSchemaGenerationError(PydanticUserError):
-    """An error raised during failures to generate a `CoreSchema` for some type.
-
-    Attributes:
-        message: Description of the error.
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message, code='schema-for-unknown-type')
-
-
-class PydanticInvalidForJsonSchema(PydanticUserError):
-    """An error raised during failures to generate a JSON schema for some `CoreSchema`.
-
-    Attributes:
-        message: Description of the error.
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message, code='invalid-for-json-schema')
-
-
-class PydanticForbiddenQualifier(PydanticUserError):
-    """An error raised if a forbidden type qualifier is found in a type annotation."""
-
-    _qualifier_repr_map: ClassVar[dict[Qualifier, str]] = {
-        'required': 'typing.Required',
-        'not_required': 'typing.NotRequired',
-        'read_only': 'typing.ReadOnly',
-        'class_var': 'typing.ClassVar',
-        'init_var': 'dataclasses.InitVar',
-        'final': 'typing.Final',
+        if (frame.classList.contains("collapsed")){
+            element.innerHTML = "&#8210;";
+            frame.classList.remove("collapsed");
+        } else {
+            element.innerHTML = "+";
+            frame.classList.add("collapsed");
+        }
     }
+</script>
+"""
 
-    def __init__(self, qualifier: Qualifier, annotation: Any) -> None:
-        super().__init__(
-            message=(
-                f'The annotation {_repr.display_as_type(annotation)!r} contains the {self._qualifier_repr_map[qualifier]!r} '
-                f'type qualifier, which is invalid in the context it is defined.'
-            ),
-            code=None,
+TEMPLATE = """
+<html>
+    <head>
+        <style type='text/css'>
+            {styles}
+        </style>
+        <title>Starlette Debugger</title>
+    </head>
+    <body>
+        <h1>500 Server Error</h1>
+        <h2>{error}</h2>
+        <div class="traceback-container">
+            <p class="traceback-title">Traceback</p>
+            <div>{exc_html}</div>
+        </div>
+        {js}
+    </body>
+</html>
+"""
+
+FRAME_TEMPLATE = """
+<div>
+    <p class="frame-title">File <span class="frame-filename">{frame_filename}</span>,
+    line <i>{frame_lineno}</i>,
+    in <b>{frame_name}</b>
+    <span class="collapse-btn" data-frame-id="{frame_filename}-{frame_lineno}" onclick="collapse(this)">{collapse_button}</span>
+    </p>
+    <div id="{frame_filename}-{frame_lineno}" class="source-code {collapsed}">{code_context}</div>
+</div>
+"""  # noqa: E501
+
+LINE = """
+<p><span class="frame-line">
+<span class="lineno">{lineno}.</span> {line}</span></p>
+"""
+
+CENTER_LINE = """
+<p class="center-line"><span class="frame-line center-line">
+<span class="lineno">{lineno}.</span> {line}</span></p>
+"""
+
+
+class ServerErrorMiddleware:
+    """
+    Handles returning 500 responses when a server error occurs.
+
+    If 'debug' is set, then traceback responses will be returned,
+    otherwise the designated 'handler' will be called.
+
+    This middleware class should generally be used to wrap *everything*
+    else up, so that unhandled exceptions anywhere in the stack
+    always result in an appropriate 500 response.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        handler: ExceptionHandler | None = None,
+        debug: bool = False,
+    ) -> None:
+        self.app = app
+        self.handler = handler
+        self.debug = debug
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        response_started = False
+
+        async def _send(message: Message) -> None:
+            nonlocal response_started, send
+
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _send)
+        except Exception as exc:
+            request = Request(scope)
+            if self.debug:
+                # In debug mode, return traceback responses.
+                response = self.debug_response(request, exc)
+            elif self.handler is None:
+                # Use our default 500 error handler.
+                response = self.error_response(request, exc)
+            else:
+                # Use an installed 500 error handler.
+                if is_async_callable(self.handler):
+                    response = await self.handler(request, exc)
+                else:
+                    response = await run_in_threadpool(self.handler, request, exc)
+
+            if not response_started:
+                await response(scope, receive, send)
+
+            # We always continue to raise the exception.
+            # This allows servers to log the error, or allows test clients
+            # to optionally raise the error within the test case.
+            raise exc
+
+    def format_line(self, index: int, line: str, frame_lineno: int, frame_index: int) -> str:
+        values = {
+            # HTML escape - line could contain < or >
+            "line": html.escape(line).replace(" ", "&nbsp"),
+            "lineno": (frame_lineno - frame_index) + index,
+        }
+
+        if index != frame_index:
+            return LINE.format(**values)
+        return CENTER_LINE.format(**values)
+
+    def generate_frame_html(self, frame: inspect.FrameInfo, is_collapsed: bool) -> str:
+        code_context = "".join(
+            self.format_line(
+                index,
+                line,
+                frame.lineno,
+                frame.index,  # type: ignore[arg-type]
+            )
+            for index, line in enumerate(frame.code_context or [])
         )
 
+        values = {
+            # HTML escape - filename could contain < or >, especially if it's a virtual
+            # file e.g. <stdin> in the REPL
+            "frame_filename": html.escape(frame.filename),
+            "frame_lineno": frame.lineno,
+            # HTML escape - if you try very hard it's possible to name a function with <
+            # or >
+            "frame_name": html.escape(frame.function),
+            "code_context": code_context,
+            "collapsed": "collapsed" if is_collapsed else "",
+            "collapse_button": "+" if is_collapsed else "&#8210;",
+        }
+        return FRAME_TEMPLATE.format(**values)
 
-__getattr__ = getattr_migration(__name__)
+    def generate_html(self, exc: Exception, limit: int = 7) -> str:
+        traceback_obj = traceback.TracebackException.from_exception(exc, capture_locals=True)
+
+        exc_html = ""
+        is_collapsed = False
+        exc_traceback = exc.__traceback__
+        if exc_traceback is not None:
+            frames = inspect.getinnerframes(exc_traceback, limit)
+            for frame in reversed(frames):
+                exc_html += self.generate_frame_html(frame, is_collapsed)
+                is_collapsed = True
+
+        if sys.version_info >= (3, 13):  # pragma: no cover
+            exc_type_str = traceback_obj.exc_type_str
+        else:  # pragma: no cover
+            exc_type_str = traceback_obj.exc_type.__name__
+
+        # escape error class and text
+        error = f"{html.escape(exc_type_str)}: {html.escape(str(traceback_obj))}"
+
+        return TEMPLATE.format(styles=STYLES, js=JS, error=error, exc_html=exc_html)
+
+    def generate_plain_text(self, exc: Exception) -> str:
+        return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+    def debug_response(self, request: Request, exc: Exception) -> Response:
+        accept = request.headers.get("accept", "")
+
+        if "text/html" in accept:
+            content = self.generate_html(exc)
+            return HTMLResponse(content, status_code=500)
+        content = self.generate_plain_text(exc)
+        return PlainTextResponse(content, status_code=500)
+
+    def error_response(self, request: Request, exc: Exception) -> Response:
+        return PlainTextResponse("Internal Server Error", status_code=500)
