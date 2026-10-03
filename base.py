@@ -1,101 +1,86 @@
 from __future__ import annotations
 
-import ssl
-import time
 import typing
+from types import TracebackType
 
-SOCKET_OPTION = typing.Union[
-    typing.Tuple[int, int, int],
-    typing.Tuple[int, int, typing.Union[bytes, bytearray]],
-    typing.Tuple[int, int, None, int],
-]
+from .._models import Request, Response
+
+T = typing.TypeVar("T", bound="BaseTransport")
+A = typing.TypeVar("A", bound="AsyncBaseTransport")
+
+__all__ = ["AsyncBaseTransport", "BaseTransport"]
 
 
-class NetworkStream:
-    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
-        raise NotImplementedError()  # pragma: nocover
+class BaseTransport:
+    def __enter__(self: T) -> T:
+        return self
 
-    def write(self, buffer: bytes, timeout: float | None = None) -> None:
-        raise NotImplementedError()  # pragma: nocover
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        self.close()
+
+    def handle_request(self, request: Request) -> Response:
+        """
+        Send a single HTTP request and return a response.
+
+        Developers shouldn't typically ever need to call into this API directly,
+        since the Client class provides all the higher level user-facing API
+        niceties.
+
+        In order to properly release any network resources, the response
+        stream should *either* be consumed immediately, with a call to
+        `response.stream.read()`, or else the `handle_request` call should
+        be followed with a try/finally block to ensuring the stream is
+        always closed.
+
+        Example usage:
+
+            with httpx.HTTPTransport() as transport:
+                req = httpx.Request(
+                    method=b"GET",
+                    url=(b"https", b"www.example.com", 443, b"/"),
+                    headers=[(b"Host", b"www.example.com")],
+                )
+                resp = transport.handle_request(req)
+                body = resp.stream.read()
+                print(resp.status_code, resp.headers, body)
+
+
+        Takes a `Request` instance as the only argument.
+
+        Returns a `Response` instance.
+        """
+        raise NotImplementedError(
+            "The 'handle_request' method must be implemented."
+        )  # pragma: no cover
 
     def close(self) -> None:
-        raise NotImplementedError()  # pragma: nocover
+        pass
 
-    def start_tls(
+
+class AsyncBaseTransport:
+    async def __aenter__(self: A) -> A:
+        return self
+
+    async def __aexit__(
         self,
-        ssl_context: ssl.SSLContext,
-        server_hostname: str | None = None,
-        timeout: float | None = None,
-    ) -> NetworkStream:
-        raise NotImplementedError()  # pragma: nocover
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self.aclose()
 
-    def get_extra_info(self, info: str) -> typing.Any:
-        return None  # pragma: nocover
-
-
-class NetworkBackend:
-    def connect_tcp(
+    async def handle_async_request(
         self,
-        host: str,
-        port: int,
-        timeout: float | None = None,
-        local_address: str | None = None,
-        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
-    ) -> NetworkStream:
-        raise NotImplementedError()  # pragma: nocover
-
-    def connect_unix_socket(
-        self,
-        path: str,
-        timeout: float | None = None,
-        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
-    ) -> NetworkStream:
-        raise NotImplementedError()  # pragma: nocover
-
-    def sleep(self, seconds: float) -> None:
-        time.sleep(seconds)  # pragma: nocover
-
-
-class AsyncNetworkStream:
-    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
-        raise NotImplementedError()  # pragma: nocover
-
-    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
-        raise NotImplementedError()  # pragma: nocover
+        request: Request,
+    ) -> Response:
+        raise NotImplementedError(
+            "The 'handle_async_request' method must be implemented."
+        )  # pragma: no cover
 
     async def aclose(self) -> None:
-        raise NotImplementedError()  # pragma: nocover
-
-    async def start_tls(
-        self,
-        ssl_context: ssl.SSLContext,
-        server_hostname: str | None = None,
-        timeout: float | None = None,
-    ) -> AsyncNetworkStream:
-        raise NotImplementedError()  # pragma: nocover
-
-    def get_extra_info(self, info: str) -> typing.Any:
-        return None  # pragma: nocover
-
-
-class AsyncNetworkBackend:
-    async def connect_tcp(
-        self,
-        host: str,
-        port: int,
-        timeout: float | None = None,
-        local_address: str | None = None,
-        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
-    ) -> AsyncNetworkStream:
-        raise NotImplementedError()  # pragma: nocover
-
-    async def connect_unix_socket(
-        self,
-        path: str,
-        timeout: float | None = None,
-        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
-    ) -> AsyncNetworkStream:
-        raise NotImplementedError()  # pragma: nocover
-
-    async def sleep(self, seconds: float) -> None:
-        raise NotImplementedError()  # pragma: nocover
+        pass
