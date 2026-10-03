@@ -1,248 +1,373 @@
-from __future__ import annotations
+from __future__ import annotations as _annotations
 
-import os
-import typing
+import warnings
+from contextlib import contextmanager
+from re import Pattern
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Literal,
+    cast,
+)
 
-from ._models import Headers
-from ._types import CertTypes, HeaderTypes, TimeoutTypes
-from ._urls import URL
+from pydantic_core import core_schema
+from typing_extensions import Self
 
-if typing.TYPE_CHECKING:
-    import ssl  # pragma: no cover
+from ..aliases import AliasGenerator
+from ..config import ConfigDict, ExtraValues, JsonDict, JsonEncoder, JsonSchemaExtraCallable
+from ..errors import PydanticUserError
+from ..warnings import PydanticDeprecatedSince20, PydanticDeprecatedSince210
 
-__all__ = ["Limits", "Proxy", "Timeout", "create_ssl_context"]
+if not TYPE_CHECKING:
+    # See PyCharm issues https://youtrack.jetbrains.com/issue/PY-21915
+    # and https://youtrack.jetbrains.com/issue/PY-51428
+    DeprecationWarning = PydanticDeprecatedSince20
+
+if TYPE_CHECKING:
+    from .._internal._schema_generation_shared import GenerateSchema
+    from ..fields import ComputedFieldInfo, FieldInfo
+
+DEPRECATION_MESSAGE = 'Support for class-based `config` is deprecated, use ConfigDict instead.'
 
 
-class UnsetType:
-    pass  # pragma: no cover
+class ConfigWrapper:
+    """Internal wrapper for Config which exposes ConfigDict items as attributes."""
 
+    __slots__ = ('config_dict',)
 
-UNSET = UnsetType()
+    config_dict: ConfigDict
 
+    # all annotations are copied directly from ConfigDict, and should be kept up to date, a test will fail if they
+    # stop matching
+    title: str | None
+    str_to_lower: bool
+    str_to_upper: bool
+    str_strip_whitespace: bool
+    str_min_length: int
+    str_max_length: int | None
+    extra: ExtraValues | None
+    frozen: bool
+    populate_by_name: bool
+    use_enum_values: bool
+    validate_assignment: bool
+    arbitrary_types_allowed: bool
+    from_attributes: bool
+    # whether to use the actual key provided in the data (e.g. alias or first alias for "field required" errors) instead of field_names
+    # to construct error `loc`s, default `True`
+    loc_by_alias: bool
+    alias_generator: Callable[[str], str] | AliasGenerator | None
+    model_title_generator: Callable[[type], str] | None
+    field_title_generator: Callable[[str, FieldInfo | ComputedFieldInfo], str] | None
+    ignored_types: tuple[type, ...]
+    allow_inf_nan: bool
+    json_schema_extra: JsonDict | JsonSchemaExtraCallable | None
+    json_encoders: dict[type[object], JsonEncoder] | None
 
-def create_ssl_context(
-    verify: ssl.SSLContext | str | bool = True,
-    cert: CertTypes | None = None,
-    trust_env: bool = True,
-) -> ssl.SSLContext:
-    import ssl
-    import warnings
+    # new in V2
+    strict: bool
+    # whether instances of models and dataclasses (including subclass instances) should re-validate, default 'never'
+    revalidate_instances: Literal['always', 'never', 'subclass-instances']
+    ser_json_timedelta: Literal['iso8601', 'float']
+    ser_json_bytes: Literal['utf8', 'base64', 'hex']
+    val_json_bytes: Literal['utf8', 'base64', 'hex']
+    ser_json_inf_nan: Literal['null', 'constants', 'strings']
+    # whether to validate default values during validation, default False
+    validate_default: bool
+    validate_return: bool
+    protected_namespaces: tuple[str | Pattern[str], ...]
+    hide_input_in_errors: bool
+    defer_build: bool
+    plugin_settings: dict[str, object] | None
+    schema_generator: type[GenerateSchema] | None
+    json_schema_serialization_defaults_required: bool
+    json_schema_mode_override: Literal['validation', 'serialization', None]
+    coerce_numbers_to_str: bool
+    regex_engine: Literal['rust-regex', 'python-re']
+    validation_error_cause: bool
+    use_attribute_docstrings: bool
+    cache_strings: bool | Literal['all', 'keys', 'none']
+    validate_by_alias: bool
+    validate_by_name: bool
+    serialize_by_alias: bool
 
-    import certifi
-
-    if verify is True:
-        if trust_env and os.environ.get("SSL_CERT_FILE"):  # pragma: nocover
-            ctx = ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
-        elif trust_env and os.environ.get("SSL_CERT_DIR"):  # pragma: nocover
-            ctx = ssl.create_default_context(capath=os.environ["SSL_CERT_DIR"])
+    def __init__(self, config: ConfigDict | dict[str, Any] | type[Any] | None, *, check: bool = True):
+        if check:
+            self.config_dict = prepare_config(config)
         else:
-            # Default case...
-            ctx = ssl.create_default_context(cafile=certifi.where())
-    elif verify is False:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    elif isinstance(verify, str):  # pragma: nocover
-        message = (
-            "`verify=<str>` is deprecated. "
-            "Use `verify=ssl.create_default_context(cafile=...)` "
-            "or `verify=ssl.create_default_context(capath=...)` instead."
-        )
-        warnings.warn(message, DeprecationWarning)
-        if os.path.isdir(verify):
-            return ssl.create_default_context(capath=verify)
-        return ssl.create_default_context(cafile=verify)
-    else:
-        ctx = verify
+            self.config_dict = cast(ConfigDict, config)
 
-    if cert:  # pragma: nocover
-        message = (
-            "`cert=...` is deprecated. Use `verify=<ssl_context>` instead,"
-            "with `.load_cert_chain()` to configure the certificate chain."
-        )
-        warnings.warn(message, DeprecationWarning)
-        if isinstance(cert, str):
-            ctx.load_cert_chain(cert)
-        else:
-            ctx.load_cert_chain(*cert)
+    @classmethod
+    def for_model(cls, bases: tuple[type[Any], ...], namespace: dict[str, Any], kwargs: dict[str, Any]) -> Self:
+        """Build a new `ConfigWrapper` instance for a `BaseModel`.
 
-    return ctx
+        The config wrapper built based on (in descending order of priority):
+        - options from `kwargs`
+        - options from the `namespace`
+        - options from the base classes (`bases`)
 
+        Args:
+            bases: A tuple of base classes.
+            namespace: The namespace of the class being created.
+            kwargs: The kwargs passed to the class being created.
 
-class Timeout:
-    """
-    Timeout configuration.
+        Returns:
+            A `ConfigWrapper` instance for `BaseModel`.
+        """
+        config_new = ConfigDict()
+        for base in bases:
+            config = getattr(base, 'model_config', None)
+            if config:
+                config_new.update(config.copy())
 
-    **Usage**:
+        config_class_from_namespace = namespace.get('Config')
+        config_dict_from_namespace = namespace.get('model_config')
 
-    Timeout(None)               # No timeouts.
-    Timeout(5.0)                # 5s timeout on all operations.
-    Timeout(None, connect=5.0)  # 5s timeout on connect, no other timeouts.
-    Timeout(5.0, connect=10.0)  # 10s timeout on connect. 5s timeout elsewhere.
-    Timeout(5.0, pool=None)     # No timeout on acquiring connection from pool.
-                                # 5s timeout elsewhere.
-    """
+        raw_annotations = namespace.get('__annotations__', {})
+        if raw_annotations.get('model_config') and config_dict_from_namespace is None:
+            raise PydanticUserError(
+                '`model_config` cannot be used as a model field name. Use `model_config` for model configuration.',
+                code='model-config-invalid-field-name',
+            )
 
-    def __init__(
-        self,
-        timeout: TimeoutTypes | UnsetType = UNSET,
-        *,
-        connect: None | float | UnsetType = UNSET,
-        read: None | float | UnsetType = UNSET,
-        write: None | float | UnsetType = UNSET,
-        pool: None | float | UnsetType = UNSET,
-    ) -> None:
-        if isinstance(timeout, Timeout):
-            # Passed as a single explicit Timeout.
-            assert connect is UNSET
-            assert read is UNSET
-            assert write is UNSET
-            assert pool is UNSET
-            self.connect = timeout.connect  # type: typing.Optional[float]
-            self.read = timeout.read  # type: typing.Optional[float]
-            self.write = timeout.write  # type: typing.Optional[float]
-            self.pool = timeout.pool  # type: typing.Optional[float]
-        elif isinstance(timeout, tuple):
-            # Passed as a tuple.
-            self.connect = timeout[0]
-            self.read = timeout[1]
-            self.write = None if len(timeout) < 3 else timeout[2]
-            self.pool = None if len(timeout) < 4 else timeout[3]
-        elif not (
-            isinstance(connect, UnsetType)
-            or isinstance(read, UnsetType)
-            or isinstance(write, UnsetType)
-            or isinstance(pool, UnsetType)
-        ):
-            self.connect = connect
-            self.read = read
-            self.write = write
-            self.pool = pool
-        else:
-            if isinstance(timeout, UnsetType):
-                raise ValueError(
-                    "httpx.Timeout must either include a default, or set all "
-                    "four parameters explicitly."
+        if config_class_from_namespace and config_dict_from_namespace:
+            raise PydanticUserError('"Config" and "model_config" cannot be used together', code='config-both')
+
+        config_from_namespace = config_dict_from_namespace or prepare_config(config_class_from_namespace)
+
+        config_new.update(config_from_namespace)
+
+        for k in list(kwargs.keys()):
+            if k in config_keys:
+                config_new[k] = kwargs.pop(k)
+
+        return cls(config_new)
+
+    # we don't show `__getattr__` to type checkers so missing attributes cause errors
+    if not TYPE_CHECKING:  # pragma: no branch
+
+        def __getattr__(self, name: str) -> Any:
+            try:
+                return self.config_dict[name]
+            except KeyError:
+                try:
+                    return config_defaults[name]
+                except KeyError:
+                    raise AttributeError(f'Config has no attribute {name!r}') from None
+
+    def core_config(self, title: str | None) -> core_schema.CoreConfig:
+        """Create a pydantic-core config.
+
+        We don't use getattr here since we don't want to populate with defaults.
+
+        Args:
+            title: The title to use if not set in config.
+
+        Returns:
+            A `CoreConfig` object created from config.
+        """
+        config = self.config_dict
+
+        if config.get('schema_generator') is not None:
+            warnings.warn(
+                'The `schema_generator` setting has been deprecated since v2.10. This setting no longer has any effect.',
+                PydanticDeprecatedSince210,
+                stacklevel=2,
+            )
+
+        if (populate_by_name := config.get('populate_by_name')) is not None:
+            # We include this patch for backwards compatibility purposes, but this config setting will be deprecated in v3.0, and likely removed in v4.0.
+            # Thus, the above warning and this patch can be removed then as well.
+            if config.get('validate_by_name') is None:
+                config['validate_by_alias'] = True
+                config['validate_by_name'] = populate_by_name
+
+        # We dynamically patch validate_by_name to be True if validate_by_alias is set to False
+        # and validate_by_name is not explicitly set.
+        if config.get('validate_by_alias') is False and config.get('validate_by_name') is None:
+            config['validate_by_name'] = True
+
+        if (not config.get('validate_by_alias', True)) and (not config.get('validate_by_name', False)):
+            raise PydanticUserError(
+                'At least one of `validate_by_alias` or `validate_by_name` must be set to True.',
+                code='validate-by-alias-and-name-false',
+            )
+
+        return core_schema.CoreConfig(
+            **{  # pyright: ignore[reportArgumentType]
+                k: v
+                for k, v in (
+                    ('title', config.get('title') or title or None),
+                    ('extra_fields_behavior', config.get('extra')),
+                    ('allow_inf_nan', config.get('allow_inf_nan')),
+                    ('str_strip_whitespace', config.get('str_strip_whitespace')),
+                    ('str_to_lower', config.get('str_to_lower')),
+                    ('str_to_upper', config.get('str_to_upper')),
+                    ('strict', config.get('strict')),
+                    ('ser_json_timedelta', config.get('ser_json_timedelta')),
+                    ('ser_json_bytes', config.get('ser_json_bytes')),
+                    ('val_json_bytes', config.get('val_json_bytes')),
+                    ('ser_json_inf_nan', config.get('ser_json_inf_nan')),
+                    ('from_attributes', config.get('from_attributes')),
+                    ('loc_by_alias', config.get('loc_by_alias')),
+                    ('revalidate_instances', config.get('revalidate_instances')),
+                    ('validate_default', config.get('validate_default')),
+                    ('str_max_length', config.get('str_max_length')),
+                    ('str_min_length', config.get('str_min_length')),
+                    ('hide_input_in_errors', config.get('hide_input_in_errors')),
+                    ('coerce_numbers_to_str', config.get('coerce_numbers_to_str')),
+                    ('regex_engine', config.get('regex_engine')),
+                    ('validation_error_cause', config.get('validation_error_cause')),
+                    ('cache_strings', config.get('cache_strings')),
+                    ('validate_by_alias', config.get('validate_by_alias')),
+                    ('validate_by_name', config.get('validate_by_name')),
+                    ('serialize_by_alias', config.get('serialize_by_alias')),
                 )
-            self.connect = timeout if isinstance(connect, UnsetType) else connect
-            self.read = timeout if isinstance(read, UnsetType) else read
-            self.write = timeout if isinstance(write, UnsetType) else write
-            self.pool = timeout if isinstance(pool, UnsetType) else pool
-
-    def as_dict(self) -> dict[str, float | None]:
-        return {
-            "connect": self.connect,
-            "read": self.read,
-            "write": self.write,
-            "pool": self.pool,
-        }
-
-    def __eq__(self, other: typing.Any) -> bool:
-        return (
-            isinstance(other, self.__class__)
-            and self.connect == other.connect
-            and self.read == other.read
-            and self.write == other.write
-            and self.pool == other.pool
+                if v is not None
+            }
         )
 
-    def __repr__(self) -> str:
-        class_name = self.__class__.__name__
-        if len({self.connect, self.read, self.write, self.pool}) == 1:
-            return f"{class_name}(timeout={self.connect})"
-        return (
-            f"{class_name}(connect={self.connect}, "
-            f"read={self.read}, write={self.write}, pool={self.pool})"
-        )
+    def __repr__(self):
+        c = ', '.join(f'{k}={v!r}' for k, v in self.config_dict.items())
+        return f'ConfigWrapper({c})'
 
 
-class Limits:
-    """
-    Configuration for limits to various client behaviors.
+class ConfigWrapperStack:
+    """A stack of `ConfigWrapper` instances."""
 
-    **Parameters:**
-
-    * **max_connections** - The maximum number of concurrent connections that may be
-            established.
-    * **max_keepalive_connections** - Allow the connection pool to maintain
-            keep-alive connections below this point. Should be less than or equal
-            to `max_connections`.
-    * **keepalive_expiry** - Time limit on idle keep-alive connections in seconds.
-    """
-
-    def __init__(
-        self,
-        *,
-        max_connections: int | None = None,
-        max_keepalive_connections: int | None = None,
-        keepalive_expiry: float | None = 5.0,
-    ) -> None:
-        self.max_connections = max_connections
-        self.max_keepalive_connections = max_keepalive_connections
-        self.keepalive_expiry = keepalive_expiry
-
-    def __eq__(self, other: typing.Any) -> bool:
-        return (
-            isinstance(other, self.__class__)
-            and self.max_connections == other.max_connections
-            and self.max_keepalive_connections == other.max_keepalive_connections
-            and self.keepalive_expiry == other.keepalive_expiry
-        )
-
-    def __repr__(self) -> str:
-        class_name = self.__class__.__name__
-        return (
-            f"{class_name}(max_connections={self.max_connections}, "
-            f"max_keepalive_connections={self.max_keepalive_connections}, "
-            f"keepalive_expiry={self.keepalive_expiry})"
-        )
-
-
-class Proxy:
-    def __init__(
-        self,
-        url: URL | str,
-        *,
-        ssl_context: ssl.SSLContext | None = None,
-        auth: tuple[str, str] | None = None,
-        headers: HeaderTypes | None = None,
-    ) -> None:
-        url = URL(url)
-        headers = Headers(headers)
-
-        if url.scheme not in ("http", "https", "socks5", "socks5h"):
-            raise ValueError(f"Unknown scheme for proxy URL {url!r}")
-
-        if url.username or url.password:
-            # Remove any auth credentials from the URL.
-            auth = (url.username, url.password)
-            url = url.copy_with(username=None, password=None)
-
-        self.url = url
-        self.auth = auth
-        self.headers = headers
-        self.ssl_context = ssl_context
+    def __init__(self, config_wrapper: ConfigWrapper):
+        self._config_wrapper_stack: list[ConfigWrapper] = [config_wrapper]
 
     @property
-    def raw_auth(self) -> tuple[bytes, bytes] | None:
-        # The proxy authentication as raw bytes.
-        return (
-            None
-            if self.auth is None
-            else (self.auth[0].encode("utf-8"), self.auth[1].encode("utf-8"))
-        )
+    def tail(self) -> ConfigWrapper:
+        return self._config_wrapper_stack[-1]
 
-    def __repr__(self) -> str:
-        # The authentication is represented with the password component masked.
-        auth = (self.auth[0], "********") if self.auth else None
+    @contextmanager
+    def push(self, config_wrapper: ConfigWrapper | ConfigDict | None):
+        if config_wrapper is None:
+            yield
+            return
 
-        # Build a nice concise representation.
-        url_str = f"{str(self.url)!r}"
-        auth_str = f", auth={auth!r}" if auth else ""
-        headers_str = f", headers={dict(self.headers)!r}" if self.headers else ""
-        return f"Proxy({url_str}{auth_str}{headers_str})"
+        if not isinstance(config_wrapper, ConfigWrapper):
+            config_wrapper = ConfigWrapper(config_wrapper, check=False)
+
+        self._config_wrapper_stack.append(config_wrapper)
+        try:
+            yield
+        finally:
+            self._config_wrapper_stack.pop()
 
 
-DEFAULT_TIMEOUT_CONFIG = Timeout(timeout=5.0)
-DEFAULT_LIMITS = Limits(max_connections=100, max_keepalive_connections=20)
-DEFAULT_MAX_REDIRECTS = 20
+config_defaults = ConfigDict(
+    title=None,
+    str_to_lower=False,
+    str_to_upper=False,
+    str_strip_whitespace=False,
+    str_min_length=0,
+    str_max_length=None,
+    # let the model / dataclass decide how to handle it
+    extra=None,
+    frozen=False,
+    populate_by_name=False,
+    use_enum_values=False,
+    validate_assignment=False,
+    arbitrary_types_allowed=False,
+    from_attributes=False,
+    loc_by_alias=True,
+    alias_generator=None,
+    model_title_generator=None,
+    field_title_generator=None,
+    ignored_types=(),
+    allow_inf_nan=True,
+    json_schema_extra=None,
+    strict=False,
+    revalidate_instances='never',
+    ser_json_timedelta='iso8601',
+    ser_json_bytes='utf8',
+    val_json_bytes='utf8',
+    ser_json_inf_nan='null',
+    validate_default=False,
+    validate_return=False,
+    protected_namespaces=('model_validate', 'model_dump'),
+    hide_input_in_errors=False,
+    json_encoders=None,
+    defer_build=False,
+    schema_generator=None,
+    plugin_settings=None,
+    json_schema_serialization_defaults_required=False,
+    json_schema_mode_override=None,
+    coerce_numbers_to_str=False,
+    regex_engine='rust-regex',
+    validation_error_cause=False,
+    use_attribute_docstrings=False,
+    cache_strings=True,
+    validate_by_alias=True,
+    validate_by_name=False,
+    serialize_by_alias=False,
+)
+
+
+def prepare_config(config: ConfigDict | dict[str, Any] | type[Any] | None) -> ConfigDict:
+    """Create a `ConfigDict` instance from an existing dict, a class (e.g. old class-based config) or None.
+
+    Args:
+        config: The input config.
+
+    Returns:
+        A ConfigDict object created from config.
+    """
+    if config is None:
+        return ConfigDict()
+
+    if not isinstance(config, dict):
+        warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning)
+        config = {k: getattr(config, k) for k in dir(config) if not k.startswith('__')}
+
+    config_dict = cast(ConfigDict, config)
+    check_deprecated(config_dict)
+    return config_dict
+
+
+config_keys = set(ConfigDict.__annotations__.keys())
+
+
+V2_REMOVED_KEYS = {
+    'allow_mutation',
+    'error_msg_templates',
+    'fields',
+    'getter_dict',
+    'smart_union',
+    'underscore_attrs_are_private',
+    'json_loads',
+    'json_dumps',
+    'copy_on_model_validation',
+    'post_init_call',
+}
+V2_RENAMED_KEYS = {
+    'allow_population_by_field_name': 'validate_by_name',
+    'anystr_lower': 'str_to_lower',
+    'anystr_strip_whitespace': 'str_strip_whitespace',
+    'anystr_upper': 'str_to_upper',
+    'keep_untouched': 'ignored_types',
+    'max_anystr_length': 'str_max_length',
+    'min_anystr_length': 'str_min_length',
+    'orm_mode': 'from_attributes',
+    'schema_extra': 'json_schema_extra',
+    'validate_all': 'validate_default',
+}
+
+
+def check_deprecated(config_dict: ConfigDict) -> None:
+    """Check for deprecated config keys and warn the user.
+
+    Args:
+        config_dict: The input config.
+    """
+    deprecated_removed_keys = V2_REMOVED_KEYS & config_dict.keys()
+    deprecated_renamed_keys = V2_RENAMED_KEYS.keys() & config_dict.keys()
+    if deprecated_removed_keys or deprecated_renamed_keys:
+        renamings = {k: V2_RENAMED_KEYS[k] for k in sorted(deprecated_renamed_keys)}
+        renamed_bullets = [f'* {k!r} has been renamed to {v!r}' for k, v in renamings.items()]
+        removed_bullets = [f'* {k!r} has been removed' for k in sorted(deprecated_removed_keys)]
+        message = '\n'.join(['Valid config keys have changed in V2:'] + renamed_bullets + removed_bullets)
+        warnings.warn(message, UserWarning)

@@ -1,228 +1,244 @@
 Metadata-Version: 2.4
-Name: pyasn1
-Version: 0.6.4
-Summary: Pure-Python implementation of ASN.1 types and DER/BER/CER codecs (X.208)
-Author-email: Ilya Etingof <etingof@gmail.com>
-Maintainer: pyasn1 maintenance organization
-Maintainer-email: Christian Heimes <christian@python.org>
-License: BSD-2-Clause
-Project-URL: Homepage, https://github.com/pyasn1/pyasn1
-Project-URL: Documentation, https://pyasn1.readthedocs.io
-Project-URL: Source, https://github.com/pyasn1/pyasn1
-Project-URL: Issues, https://github.com/pyasn1/pyasn1/issues
-Project-URL: Changelog, https://pyasn1.readthedocs.io/en/latest/changelog.html
-Platform: any
+Name: pycparser
+Version: 3.0
+Summary: C parser in Python
+Author-email: Eli Bendersky <eliben@gmail.com>
+Maintainer-email: Eli Bendersky <eliben@gmail.com>
+License-Expression: BSD-3-Clause
+Project-URL: Homepage, https://github.com/eliben/pycparser
 Classifier: Development Status :: 5 - Production/Stable
-Classifier: Environment :: Console
-Classifier: Intended Audience :: Developers
-Classifier: Intended Audience :: Education
-Classifier: Intended Audience :: Information Technology
-Classifier: Intended Audience :: System Administrators
-Classifier: Intended Audience :: Telecommunications Industry
-Classifier: Natural Language :: English
-Classifier: Operating System :: OS Independent
 Classifier: Programming Language :: Python :: 3
-Classifier: Programming Language :: Python :: 3.8
-Classifier: Programming Language :: Python :: 3.9
 Classifier: Programming Language :: Python :: 3.10
 Classifier: Programming Language :: Python :: 3.11
 Classifier: Programming Language :: Python :: 3.12
 Classifier: Programming Language :: Python :: 3.13
 Classifier: Programming Language :: Python :: 3.14
-Classifier: Programming Language :: Python :: Implementation :: CPython
-Classifier: Programming Language :: Python :: Implementation :: PyPy
-Classifier: Topic :: Communications
-Classifier: Topic :: Software Development :: Libraries :: Python Modules
-Requires-Python: >=3.8
-Description-Content-Type: text/markdown
-License-File: LICENSE.rst
+Requires-Python: >=3.10
+Description-Content-Type: text/x-rst
+License-File: LICENSE
 Dynamic: license-file
 
+===============
+pycparser v3.00
+===============
 
-ASN.1 library for Python
-------------------------
-[![PyPI](https://img.shields.io/pypi/v/pyasn1.svg?maxAge=2592000)](https://pypi.org/project/pyasn1)
-[![Python Versions](https://img.shields.io/pypi/pyversions/pyasn1.svg)](https://pypi.org/project/pyasn1/)
-[![Build status](https://github.com/pyasn1/pyasn1/actions/workflows/main.yml/badge.svg)](https://github.com/pyasn1/pyasn1/actions/workflows/main.yml)
-[![Coverage Status](https://img.shields.io/codecov/c/github/pyasn1/pyasn1.svg)](https://codecov.io/github/pyasn1/pyasn1)
-[![GitHub license](https://img.shields.io/badge/license-BSD-blue.svg)](https://raw.githubusercontent.com/pyasn1/pyasn1/master/LICENSE.txt)
 
-This is a free and open source implementation of ASN.1 types and codecs
-as a Python package. It has been first written to support particular
-protocol (SNMP) but then generalized to be suitable for a wide range
-of protocols based on
-[ASN.1 specification](https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-X.208-198811-W!!PDF-E&type=items).
+.. image:: https://github.com/eliben/pycparser/workflows/pycparser-tests/badge.svg
+  :align: center
+  :target: https://github.com/eliben/pycparser/actions
 
-**NOTE:** The package is now maintained by *Christian Heimes* and
-*Simon Pichugin* in project https://github.com/pyasn1/pyasn1.
+----
 
-Features
---------
+.. contents::
+    :backlinks: none
 
-* Generic implementation of ASN.1 types (X.208)
-* Standards compliant BER/CER/DER codecs
-* Can operate on streams of serialized data
-* Dumps/loads ASN.1 structures from Python types
-* 100% Python, works with Python 3.8+
-* MT-safe
-* Contributed ASN.1 compiler [Asn1ate](https://github.com/kimgr/asn1ate)
+.. sectnum::
 
-Why using pyasn1
-----------------
+Introduction
+============
 
-ASN.1 solves the data serialisation problem. This solution was
-designed long ago by the wise Ancients. Back then, they did not
-have the luxury of wasting bits. That is why ASN.1 is designed
-to serialise data structures of unbounded complexity into
-something compact and efficient when it comes to processing
-the data.
+What is pycparser?
+------------------
 
-That probably explains why many network protocols and file formats
-still rely on the 30+ years old technology. Including a number of
-high-profile Internet protocols and file formats.
+**pycparser** is a parser for the C language, written in pure Python. It is a
+module designed to be easily integrated into applications that need to parse
+C source code.
 
-Quite a number of books cover the topic of ASN.1. 
-[Communication between heterogeneous systems](http://www.oss.com/asn1/dubuisson.html)
-by Olivier Dubuisson is one of those high quality books freely 
-available on the Internet.
+What is it good for?
+--------------------
 
-The pyasn1 package is designed to help Python programmers tackling
-network protocols and file formats at the comfort of their Python
-prompt. The tool struggles to capture all aspects of a rather
-complicated ASN.1 system and to represent it on the Python terms.
+Anything that needs C code to be parsed. The following are some uses for
+**pycparser**, taken from real user reports:
 
-How to use pyasn1
------------------
+* C code obfuscator
+* Front-end for various specialized C compilers
+* Static code checker
+* Automatic unit-test discovery
+* Adding specialized extensions to the C language
 
-With pyasn1 you can build Python objects from ASN.1 data structures.
-For example, the following ASN.1 data structure:
+One of the most popular uses of **pycparser** is in the `cffi
+<https://cffi.readthedocs.io/en/latest/>`_ library, which uses it to parse the
+declarations of C functions and types in order to auto-generate FFIs.
 
-```bash
-Record ::= SEQUENCE {
-  id        INTEGER,
-  room  [0] INTEGER OPTIONAL,
-  house [1] INTEGER DEFAULT 0
-}
-```
+**pycparser** is unique in the sense that it's written in pure Python - a very
+high level language that's easy to experiment with and tweak. To people familiar
+with Lex and Yacc, **pycparser**'s code will be simple to understand. It also
+has no external dependencies (except for a Python interpreter), making it very
+simple to install and deploy.
 
-Could be expressed in pyasn1 like this:
+Which version of C does pycparser support?
+------------------------------------------
 
-```python
-class Record(Sequence):
-    componentType = NamedTypes(
-        NamedType('id', Integer()),
-        OptionalNamedType(
-            'room', Integer().subtype(
-                implicitTag=Tag(tagClassContext, tagFormatSimple, 0)
-            )
-        ),
-        DefaultedNamedType(
-            'house', Integer(0).subtype(
-                implicitTag=Tag(tagClassContext, tagFormatSimple, 1)
-            )
-        )
-    )
-```
+**pycparser** aims to support the full C99 language (according to the standard
+ISO/IEC 9899). Some features from C11 are also supported, and patches to support
+more are welcome.
 
-It is in the spirit of ASN.1 to take abstract data description 
-and turn it into a programming language specific form.
-Once you have your ASN.1 data structure expressed in Python, you
-can use it along the lines of similar Python type (e.g. ASN.1
-`SET` is similar to Python `dict`, `SET OF` to `list`):
+**pycparser** supports very few GCC extensions, but it's fairly easy to set
+things up so that it parses code with a lot of GCC-isms successfully. See the
+`FAQ <https://github.com/eliben/pycparser/wiki/FAQ>`_ for more details.
 
-```python
->>> record = Record()
->>> record['id'] = 123
->>> record['room'] = 321
->>> str(record)
-Record:
- id=123
- room=321
->>>
-```
+What grammar does pycparser follow?
+-----------------------------------
 
-Part of the power of ASN.1 comes from its serialisation features. You
-can serialise your data structure and send it over the network.
+**pycparser** very closely follows the C grammar provided in Annex A of the C99
+standard (ISO/IEC 9899).
 
-```python
->>> from pyasn1.codec.der.encoder import encode
->>> substrate = encode(record)
->>> hexdump(substrate)
-00000: 30 07 02 01 7B 80 02 01 41
-```
+How is pycparser licensed?
+--------------------------
 
-Conversely, you can turn serialised ASN.1 content, as received from
-network or read from a file, into a Python object which you can
-introspect, modify, encode and send back.
+`BSD license <https://github.com/eliben/pycparser/blob/master/LICENSE>`_.
 
-```python
->>> from pyasn1.codec.der.decoder import decode
->>> received_record, rest_of_substrate = decode(substrate, asn1Spec=Record())
->>>
->>> for field in received_record:
->>>    print('{} is {}'.format(field, received_record[field]))
-id is 123
-room is 321
-house is 0
->>>
->>> record == received_record
-True
->>> received_record.update(room=123)
->>> substrate = encode(received_record)
->>> hexdump(substrate)
-00000: 30 06 02 01 7B 80 01 7B
-```
+Contact details
+---------------
 
-The pyasn1 classes struggle to emulate their Python prototypes (e.g. int,
-list, dict etc.). But ASN.1 types exhibit more complicated behaviour.
-To make life easier for a Pythonista, they can turn their pyasn1
-classes into Python built-ins:
+For reporting problems with **pycparser** or submitting feature requests, please
+open an `issue <https://github.com/eliben/pycparser/issues>`_, or submit a
+pull request.
 
-```python
->>> from pyasn1.codec.native.encoder import encode
->>> encode(record)
-{'id': 123, 'room': 321, 'house': 0}
-```
 
-Or vice-versa -- you can initialize an ASN.1 structure from a tree of
-Python objects:
+Installing
+==========
 
-```python
->>> from pyasn1.codec.native.decoder import decode
->>> record = decode({'id': 123, 'room': 321, 'house': 0}, asn1Spec=Record())
->>> str(record)
-Record:
- id=123
- room=321
->>>
-```
+Prerequisites
+-------------
 
-With ASN.1 design, serialisation codecs are decoupled from data objects,
-so you could turn every single ASN.1 object into many different 
-serialised forms. As of this moment, pyasn1 supports BER, DER, CER and
-Python built-ins codecs. The extremely compact PER encoding is expected
-to be introduced in the upcoming pyasn1 release.
+**pycparser** is being tested with modern versions of Python on
+Linux, macOS and Windows. See `the CI dashboard <https://github.com/eliben/pycparser/actions/workflows/ci.yml>`__
+for details.
 
-More information on pyasn1 APIs can be found in the
-[documentation](https://pyasn1.readthedocs.io/en/latest/pyasn1/contents.html),
-compiled ASN.1 modules for different protocols and file formats
-could be found in the pyasn1-modules 
-[repo](https://github.com/pyasn1/pyasn1-modules).
+**pycparser** has no external dependencies.
 
-How to get pyasn1
------------------
+Installation process
+--------------------
 
-The pyasn1 package is distributed under terms and conditions of 2-clause
-BSD [license](https://pyasn1.readthedocs.io/en/latest/license.html). Source code is freely
-available as a GitHub [repo](https://github.com/pyasn1/pyasn1).
+The recommended way to install **pycparser** is with ``pip``::
 
-You could `pip install pyasn1` or download it from [PyPI](https://pypi.org/project/pyasn1).
+    > pip install pycparser
 
-If something does not work as expected, 
-[open an issue](https://github.com/epyasn1/pyasn1/issues) at GitHub or
-post your question [on Stack Overflow](https://stackoverflow.com/questions/ask)
-or try browsing pyasn1 
-[mailing list archives](https://sourceforge.net/p/pyasn1/mailman/pyasn1-users/).
+Using
+=====
 
-Copyright (c) 2005-2020, [Ilya Etingof](mailto:etingof@gmail.com).
-All rights reserved.
+Interaction with the C preprocessor
+-----------------------------------
+
+In order to be compilable, C code must be preprocessed by the C preprocessor -
+``cpp``. A compatible ``cpp`` handles preprocessing directives like ``#include`` and
+``#define``, removes comments, and performs other minor tasks that prepare the C
+code for compilation.
+
+For all but the most trivial snippets of C code **pycparser**, like a C
+compiler, must receive preprocessed C code in order to function correctly. If
+you import the top-level ``parse_file`` function from the **pycparser** package,
+it will interact with ``cpp`` for you, as long as it's in your PATH, or you
+provide a path to it.
+
+Note also that you can use ``gcc -E`` or ``clang -E`` instead of ``cpp``. See
+the ``using_gcc_E_libc.py`` example for more details. Windows users can download
+and install a binary build of Clang for Windows `from this website
+<http://llvm.org/releases/download.html>`_.
+
+What about the standard C library headers?
+------------------------------------------
+
+C code almost always ``#include``\s various header files from the standard C
+library, like ``stdio.h``. While (with some effort) **pycparser** can be made to
+parse the standard headers from any C compiler, it's much simpler to use the
+provided "fake" standard includes for C11 in ``utils/fake_libc_include``. These
+are standard C header files that contain only the bare necessities to allow
+valid parsing of the files that use them. As a bonus, since they're minimal, it
+can significantly improve the performance of parsing large C files.
+
+The key point to understand here is that **pycparser** doesn't really care about
+the semantics of types. It only needs to know whether some token encountered in
+the source is a previously defined type. This is essential in order to be able
+to parse C correctly.
+
+See `this blog post
+<https://eli.thegreenplace.net/2015/on-parsing-c-type-declarations-and-fake-headers>`_
+for more details.
+
+Note that the fake headers are not included in the ``pip`` package nor installed
+via the package build (`#224 <https://github.com/eliben/pycparser/issues/224>`_).
+
+Basic usage
+-----------
+
+Take a look at the |examples|_ directory of the distribution for a few examples
+of using **pycparser**. These should be enough to get you started. Please note
+that most realistic C code samples would require running the C preprocessor
+before passing the code to **pycparser**; see the previous sections for more
+details.
+
+.. |examples| replace:: ``examples``
+.. _examples: examples
+
+
+Advanced usage
+--------------
+
+The public interface of **pycparser** is well documented with comments in
+``pycparser/c_parser.py``. For a detailed overview of the various AST nodes
+created by the parser, see ``pycparser/_c_ast.cfg``.
+
+There's also a `FAQ available here <https://github.com/eliben/pycparser/wiki/FAQ>`_.
+In any case, you can always drop me an `email <eliben@gmail.com>`_ for help.
+
+
+Modifying
+=========
+
+There are a few points to keep in mind when modifying **pycparser**:
+
+* The code for **pycparser**'s AST nodes is automatically generated from a
+  configuration file - ``_c_ast.cfg``, by ``_ast_gen.py``. If you modify the AST
+  configuration, make sure to re-generate the code. This can be done by running
+  the ``_ast_gen.py`` script (from the repository root or the
+  ``pycparser`` directory).
+* Read the docstring in the constructor of the ``CParser`` class for details
+  on configuration and compatibility arguments.
+
+
+Package contents
+================
+
+Once you unzip the ``pycparser`` package, you'll see the following files and
+directories:
+
+README.rst:
+  This README file.
+
+LICENSE:
+  The pycparser license
+
+setup.py:
+  Legacy installation script (build metadata lives in ``pyproject.toml``).
+
+pyproject.toml:
+  Package metadata and build configuration.
+
+examples/:
+  A directory with some examples of using **pycparser**
+
+pycparser/:
+  The **pycparser** module source code.
+
+tests/:
+  Unit tests.
+
+utils/fake_libc_include:
+  Minimal standard C library include files that should allow to parse any C code.
+  Note that these headers now include C11 code, so they may not work when the
+  preprocessor is configured to an earlier C standard (like ``-std=c99``).
+
+utils/internal/:
+  Internal utilities for my own use. You probably don't need them.
+
+
+Contributors
+============
+
+Some people have contributed to **pycparser** by opening issues on bugs they've
+found and/or submitting patches. The list of contributors is in the CONTRIBUTORS
+file in the source distribution. After **pycparser** moved to Github I stopped
+updating this list because Github does a much better job at tracking
+contributions.
