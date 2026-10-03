@@ -1,94 +1,189 @@
-from __future__ import annotations
+"""Pydantic-specific errors."""
 
-import contextlib
-import dataclasses
-import sys
-import typing
+from __future__ import annotations as _annotations
 
-__all__ = ["ExceptionGroup"]
+import re
+from typing import Any, ClassVar, Literal
+
+from typing_extensions import Self
+from typing_inspection.introspection import Qualifier
+
+from pydantic._internal import _repr
+
+from ._migration import getattr_migration
+from .version import version_short
+
+__all__ = (
+    'PydanticUserError',
+    'PydanticUndefinedAnnotation',
+    'PydanticImportError',
+    'PydanticSchemaGenerationError',
+    'PydanticInvalidForJsonSchema',
+    'PydanticForbiddenQualifier',
+    'PydanticErrorCodes',
+)
+
+# We use this URL to allow for future flexibility about how we host the docs, while allowing for Pydantic
+# code in the while with "old" URLs to still work.
+# 'u' refers to "user errors" - e.g. errors caused by developers using pydantic, as opposed to validation errors.
+DEV_ERROR_DOCS_URL = f'https://errors.pydantic.dev/{version_short()}/u/'
+PydanticErrorCodes = Literal[
+    'class-not-fully-defined',
+    'custom-json-schema',
+    'decorator-missing-field',
+    'discriminator-no-field',
+    'discriminator-alias-type',
+    'discriminator-needs-literal',
+    'discriminator-alias',
+    'discriminator-validator',
+    'callable-discriminator-no-tag',
+    'typed-dict-version',
+    'model-field-overridden',
+    'model-field-missing-annotation',
+    'config-both',
+    'removed-kwargs',
+    'circular-reference-schema',
+    'invalid-for-json-schema',
+    'json-schema-already-used',
+    'base-model-instantiated',
+    'undefined-annotation',
+    'schema-for-unknown-type',
+    'import-error',
+    'create-model-field-definitions',
+    'validator-no-fields',
+    'validator-invalid-fields',
+    'validator-instance-method',
+    'validator-input-type',
+    'root-validator-pre-skip',
+    'model-serializer-instance-method',
+    'validator-field-config-info',
+    'validator-v1-signature',
+    'validator-signature',
+    'field-serializer-signature',
+    'model-serializer-signature',
+    'multiple-field-serializers',
+    'invalid-annotated-type',
+    'type-adapter-config-unused',
+    'root-model-extra',
+    'unevaluable-type-annotation',
+    'dataclass-init-false-extra-allow',
+    'clashing-init-and-init-var',
+    'model-config-invalid-field-name',
+    'with-config-on-model',
+    'dataclass-on-model',
+    'validate-call-type',
+    'unpack-typed-dict',
+    'overlapping-unpack-typed-dict',
+    'invalid-self-type',
+    'validate-by-alias-and-name-false',
+]
 
 
-def __dir__() -> list[str]:
-    return __all__
+class PydanticErrorMixin:
+    """A mixin class for common functionality shared by all Pydantic-specific errors.
 
-
-if sys.version_info >= (3, 11):  # pragma: no cover
-    from builtins import ExceptionGroup
-else:  # pragma: no cover
-
-    class ExceptionGroup(Exception):
-        """A minimal implementation of :external:exc:`ExceptionGroup` from Python 3.11.
-
-        If :external:exc:`ExceptionGroup` is already defined by Python itself,
-        that version is used instead.
-        """
-
-        message: str
-        exceptions: list[Exception]
-
-        def __init__(self, message: str, exceptions: list[Exception]) -> None:
-            self.message = message
-            self.exceptions = exceptions
-
-        def __repr__(self) -> str:
-            return f"{self.__class__.__name__}({self.message!r}, {self.exceptions!r})"
-
-
-@dataclasses.dataclass
-class _ErrorCollector:
+    Attributes:
+        message: A message describing the error.
+        code: An optional error code from PydanticErrorCodes enum.
     """
-    Collect errors into ExceptionGroups.
 
-    Used like this:
+    def __init__(self, message: str, *, code: PydanticErrorCodes | None) -> None:
+        self.message = message
+        self.code = code
 
-        collector = _ErrorCollector()
-        # Add a single exception
-        collector.error(ValueError("one"))
+    def __str__(self) -> str:
+        if self.code is None:
+            return self.message
+        else:
+            return f'{self.message}\n\nFor further information visit {DEV_ERROR_DOCS_URL}{self.code}'
 
-        # Supports nesting, including combining ExceptionGroups
-        with collector.collect():
-            raise ValueError("two")
-        collector.finalize("Found some errors")
 
-    Since making a collector and then calling finalize later is a common pattern,
-    a convenience method ``on_exit`` is provided.
+class PydanticUserError(PydanticErrorMixin, TypeError):
+    """An error raised due to incorrect use of Pydantic."""
+
+
+class PydanticUndefinedAnnotation(PydanticErrorMixin, NameError):
+    """A subclass of `NameError` raised when handling undefined annotations during `CoreSchema` generation.
+
+    Attributes:
+        name: Name of the error.
+        message: Description of the error.
     """
 
-    errors: list[Exception] = dataclasses.field(default_factory=list, init=False)
+    def __init__(self, name: str, message: str) -> None:
+        self.name = name
+        super().__init__(message=message, code='undefined-annotation')
 
-    def finalize(self, msg: str) -> None:
-        """Raise a group exception if there are any errors."""
-        if self.errors:
-            raise ExceptionGroup(msg, self.errors)
+    @classmethod
+    def from_name_error(cls, name_error: NameError) -> Self:
+        """Convert a `NameError` to a `PydanticUndefinedAnnotation` error.
 
-    @contextlib.contextmanager
-    def on_exit(self, msg: str) -> typing.Generator[_ErrorCollector, None, None]:
+        Args:
+            name_error: `NameError` to be converted.
+
+        Returns:
+            Converted `PydanticUndefinedAnnotation` error.
         """
-        Calls finalize if no uncollected errors were present.
-
-        Uncollected errors are raised normally.
-        """
-        yield self
-        self.finalize(msg)
-
-    @contextlib.contextmanager
-    def collect(self, *err_cls: type[Exception]) -> typing.Generator[None, None, None]:
-        """
-        Context manager to collect errors into the error list.
-
-        Must be inside loops, as only one error can be collected at a time.
-        """
-        error_classes = err_cls or (Exception,)
         try:
-            yield
-        except ExceptionGroup as error:
-            self.errors.extend(error.exceptions)
-        except error_classes as error:
-            self.errors.append(error)
+            name = name_error.name  # type: ignore  # python > 3.10
+        except AttributeError:
+            name = re.search(r".*'(.+?)'", str(name_error)).group(1)  # type: ignore[union-attr]
+        return cls(name=name, message=str(name_error))
 
-    def error(
-        self,
-        error: Exception,
-    ) -> None:
-        """Add an error to the list."""
-        self.errors.append(error)
+
+class PydanticImportError(PydanticErrorMixin, ImportError):
+    """An error raised when an import fails due to module changes between V1 and V2.
+
+    Attributes:
+        message: Description of the error.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code='import-error')
+
+
+class PydanticSchemaGenerationError(PydanticUserError):
+    """An error raised during failures to generate a `CoreSchema` for some type.
+
+    Attributes:
+        message: Description of the error.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code='schema-for-unknown-type')
+
+
+class PydanticInvalidForJsonSchema(PydanticUserError):
+    """An error raised during failures to generate a JSON schema for some `CoreSchema`.
+
+    Attributes:
+        message: Description of the error.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code='invalid-for-json-schema')
+
+
+class PydanticForbiddenQualifier(PydanticUserError):
+    """An error raised if a forbidden type qualifier is found in a type annotation."""
+
+    _qualifier_repr_map: ClassVar[dict[Qualifier, str]] = {
+        'required': 'typing.Required',
+        'not_required': 'typing.NotRequired',
+        'read_only': 'typing.ReadOnly',
+        'class_var': 'typing.ClassVar',
+        'init_var': 'dataclasses.InitVar',
+        'final': 'typing.Final',
+    }
+
+    def __init__(self, qualifier: Qualifier, annotation: Any) -> None:
+        super().__init__(
+            message=(
+                f'The annotation {_repr.display_as_type(annotation)!r} contains the {self._qualifier_repr_map[qualifier]!r} '
+                f'type qualifier, which is invalid in the context it is defined.'
+            ),
+            code=None,
+        )
+
+
+__getattr__ = getattr_migration(__name__)
